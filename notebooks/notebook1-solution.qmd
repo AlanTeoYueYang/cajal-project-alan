@@ -1,0 +1,506 @@
+---
+title: "Notebook 1 — Statistical Inference & Differential Expression (Solutions)"
+subtitle: "CAJAL Neuromics 2026 · Spinal Cord Injury"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(Seurat)
+library(harmony)
+library(edgeR)
+library(ggplot2)
+library(ggalluvial)
+library(dplyr)
+library(patchwork)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(splatter)
+library(sparseMatrixStats)
+
+PROJ_DIR <- "~/cajal-project-alan/"
+DATA_DIR <- "~/cajal-project-alan/data/"
+FIG_DIR  <- "~/cajal-project-alan/figures/"
+GIT_DIR  <- "~/cajal-project-alan/"
+source(file.path(GIT_DIR, "setup-quarto-visualization.R"))
+```
+
+---
+
+## 1. Raw count distributions 
+
+```{r}
+#| label: load-raw
+sci = readRDS(file.path(DATA_DIR, "sci-subset-atlas-no-annotation.rds"))
+counts = GetAssayData(sci, layer = "counts")
+```
+
+```{r}
+#| label: raw-distributions
+p1 = ggplot(data.frame(x = colSums(counts)), aes(x = x)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "steelblue", colour = "white", alpha = 0.4) +
+    scale_x_log10() +
+    labs(title = "Library size per cell", x = "Total UMI count (log scale)", y = "Density") +
+    theme_minimal()
+
+set.seed(42)
+sample_cells = sample(ncol(counts), 1000)
+p2 = ggplot(data.frame(x = counts[, sample_cells]@x), aes(x = x)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "tomato", colour = "white", alpha = 0.4) +
+    scale_x_log10() +
+    labs(title = "All non-zero counts (100 random cells)", x = "UMI count (log scale)", y = "Density") +
+    theme_minimal()
+
+p1 + p2
+```
+
+---
+
+## 2. Simulating count data
+
+```{r}
+#| label: simulate-counts
+sim_poisson = simulate_counts_naive("poisson", n_genes = 500, n_cells = 100)
+sim_gaussian = simulate_counts_naive("gaussian", n_genes = 500, n_cells = 100)
+sim_nb = simulate_counts_naive("nb", n_genes = 500, n_cells = 100)
+
+counts_df = rbind(
+    data.frame(x = sim_gaussian[sim_gaussian > 0], model = "Gaussian"),
+    data.frame(x = sim_poisson[sim_poisson > 0], model = "Poisson"),
+    data.frame(x = sim_nb[sim_nb > 0], model = "NB")
+)
+counts_df$model = factor(counts_df$model, levels = c("Gaussian", "Poisson", "NB"))
+
+ggplot(counts_df, aes(x = x)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 40, fill = "steelblue", colour = "white", alpha = 0.4) +
+    scale_x_log10() +
+    facet_wrap(~ model, nrow = 1) +
+    labs(x = "Count (log scale)", y = "Density") +
+    theme_minimal()
+```
+
+---
+
+## 3. Why NBGMM?
+
+To model differential expression in scRNA-seq properly, we need a distribution that matches how count data actually behaves. This section builds intuition for why the **Negative Binomial Generalised Mixed Model (NBGMM)** is the right choice.
+
+### 3a. Overdispersion — why NB over Poisson
+
+**The Poisson assumption.** The simplest count model is Poisson, where the variance equals the mean:
+
+$$\text{Var}[X] = \mathbb{E}[X] = \mu$$
+
+In scRNA-seq, this would mean a gene with mean expression 10 should have variance 10 across cells. In practice, the variance is much higher — this is **overdispersion**.
+
+**Why scRNA-seq is overdispersed.** Gene expression is inherently stochastic. Transcription happens in bursts; cells in the same population differ in their regulatory state, cell cycle phase, and local microenvironment. This biological cell-to-cell variation adds variance on top of the Poisson sampling noise.
+
+**The Negative Binomial distribution** adds a dispersion parameter `size` (also written φ or 1/α):
+
+$$\text{Var}[X] = \mu + \frac{\mu^2}{\text{size}}$$
+
+As `size` → ∞, the NB approaches Poisson. Small `size` (e.g. 0.1–1) means high overdispersion — typical for scRNA-seq.
+
+**What about zero-inflated models?** Single-cell data contains many zeros — often >90% of entries are zero. These zeros come from two sources:
+
+- **Structural zeros**: the gene is genuinely not expressed in that cell
+- **Dropout zeros**: the gene was expressed but not captured due to low sequencing depth or PCR failure
+
+A **Zero-Inflated Negative Binomial (ZINB)** model explicitly models this:
+
+$$P(X = 0) = \pi + (1 - \pi) \cdot P_\text{NB}(X = 0)$$
+
+where π is the probability of a structural (dropout) zero. However, in practice NB is often preferred: modern 10x Chromium protocols have lower dropout rates than older protocols, and the two types of zeros are statistically hard to separate. NB already predicts many zeros naturally for low-mean genes, and adding the zero-inflation parameter often increases model complexity without improving DE results.
+
+> **Predict before you run:** On a log-log plot of variance vs. mean, where would you expect Poisson data to fall relative to NB?
+
+```{r}
+#| label: demo-overdispersion
+set.seed(42)
+n_genes_mv = 500
+n_cells_mv = 100
+gene_means = exp(rnorm(n_genes_mv, mean = log(5), sd = 1.5))
+
+sim_pois_mv = matrix(rpois(n_genes_mv * n_cells_mv, lambda = gene_means),
+    nrow = n_genes_mv, ncol = n_cells_mv)
+sim_nb_mv = matrix(rnbinom(n_genes_mv * n_cells_mv, size = 0.5, mu = gene_means),
+    nrow = n_genes_mv, ncol = n_cells_mv)
+
+real_means = sparseMatrixStats::rowMeans2(counts)
+real_vars = sparseMatrixStats::rowSds(counts)^2
+
+mv_df = rbind(
+    data.frame(mean = rowMeans(sim_pois_mv), var = apply(sim_pois_mv, 1, var), model = "Poisson (simulated)"),
+    data.frame(mean = rowMeans(sim_nb_mv), var = apply(sim_nb_mv, 1, var), model = "NB (simulated)"),
+    data.frame(mean = real_means, var = real_vars, model = "Real data")
+)
+mv_df = mv_df[mv_df$mean > 0 & mv_df$var > 0, ]
+mv_df$model = factor(mv_df$model, levels = c("Poisson (simulated)", "NB (simulated)", "Real data"))
+
+ggplot(mv_df, aes(x = mean, y = var)) +
+    geom_point(alpha = 0.4, size = 0.6, colour = "steelblue") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "tomato") +
+    scale_x_log10() +
+    scale_y_log10() +
+    facet_wrap(~ model, nrow = 1, scales = "free") +
+    labs(
+        title = "Mean–variance relationship",
+        subtitle = "Real scRNA-seq data is overdispersed like NB — Poisson is constrained to the diagonal",
+        x = "Gene mean", y = "Gene variance"
+    ) +
+    theme_minimal()
+```
+
+### 3b. Replicate structure — why a mixed model
+
+Each biological replicate (animal/sample) has its own baseline expression level — a **random effect** shared by all cells from that sample. When you pool cells across replicates and ignore this structure, the extra between-replicate variance inflates the apparent spread of each group, making it easy to call false positives.
+
+The **mixed model** in NBGMM accounts for this: it explicitly models the within-replicate correlation, so that the test statistic reflects between-replicate variation (the true unit of replication) rather than between-cell variation.
+
+> **Predict before you run:** If each replicate has a random shift in mean expression, what will the pooled distribution look like compared to each individual replicate?
+
+```{r}
+#| label: demo-replicates
+#| fig-width: 14
+#| fig-height: 6
+set.seed(42)
+n_samples_demo = 6
+n_cells_demo = 80
+base_mean = 5
+de_fc_demo = 2
+
+group_demo = c(rep("Control", 3), rep("Treated", 3))
+group_fc = c(rep(1, 3), rep(de_fc_demo, 3))
+sample_effects = exp(rnorm(n_samples_demo, mean = 0, sd = 0.5))
+
+cells_list = lapply(seq_len(n_samples_demo), function(i) {
+    mu_i = base_mean * sample_effects[i] * group_fc[i]
+    data.frame(
+        count = rnbinom(n_cells_demo, size = 1, mu = mu_i),
+        replicate = paste0("S", i),
+        group = group_demo[i]
+    )
+})
+cells_df = do.call(rbind, cells_list)
+cells_df$replicate = factor(cells_df$replicate)
+
+p_pooled = ggplot(cells_df, aes(x = count + 1, fill = group, colour = group)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 40, position = "identity", alpha = 0.3, colour = "white") +
+    geom_density(alpha = 0) +
+    scale_x_log10() +
+    scale_fill_manual(values = c("steelblue", "tomato")) +
+    scale_colour_manual(values = c("steelblue", "tomato")) +
+    labs(
+        title = "Pooled (ignoring replicates)",
+        subtitle = "Broad mixture — extra width is replicate noise,\nnot biology",
+        x = "Count + 1 (log scale)", y = "Density", fill = "Group"
+    ) +
+    guides(colour = "none") +
+    theme_minimal()
+
+p_per_sample = ggplot(cells_df, aes(x = count + 1, fill = group, colour = group)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 25, colour = "white", alpha = 0.3) +
+    geom_density(alpha = 0) +
+    scale_x_log10() +
+    scale_fill_manual(values = c("steelblue", "tomato")) +
+    scale_colour_manual(values = c("steelblue", "tomato")) +
+    facet_wrap(~ replicate, nrow = 2) +
+    labs(
+        title = "Per replicate",
+        subtitle = "Each replicate follows a tight NB —\nbut means shift between replicates",
+        x = "Count + 1 (log scale)", y = "Density", fill = "Group"
+    ) +
+    guides(colour = "none") +
+    theme_minimal()
+
+p_pooled + p_per_sample + plot_layout(widths = c(1, 2))
+```
+
+### 3c. DE effect size (`de_fc`)
+
+```{r}
+#| label: demo-de-fc
+sim_low_fc = simulate_counts(n_genes = 1000, n_cells = 400, de_prob = 0.2, de_fc = 1.5, n_samples = 4)
+sim_high_fc = simulate_counts(n_genes = 1000, n_cells = 400, de_prob = 0.2, de_fc = 4, n_samples = 4)
+
+lfc_df = rbind(
+    transform(compute_logfc(sim_low_fc), scenario = "de_fc = 1.5"),
+    transform(compute_logfc(sim_high_fc), scenario = "de_fc = 4")
+)
+
+ggplot(lfc_df, aes(x = logFC, fill = is_de, colour = is_de)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 60, position = "identity", alpha = 0.3, colour = "white") +
+    geom_density(alpha = 0) +
+    facet_wrap(~ scenario, nrow = 1) +
+    scale_fill_manual(values = c("grey70", "tomato"), labels = c("not DE", "true DE")) +
+    scale_colour_manual(values = c("grey50", "tomato"), labels = c("not DE", "true DE")) +
+    labs(x = "log2 fold change (group means)", y = "Density", fill = NULL, colour = NULL) +
+    theme_minimal()
+```
+
+### 3d. DE probability (`de_prob`)
+
+```{r}
+#| label: demo-de-prob
+sim_low_prob = simulate_counts(n_genes = 1000, n_cells = 400, de_prob = 0.05, de_fc = 2, n_samples = 4)
+sim_high_prob = simulate_counts(n_genes = 1000, n_cells = 400, de_prob = 0.4, de_fc = 2, n_samples = 4)
+
+de_df = rbind(
+    data.frame(scenario = "de_prob = 0.05",
+        type = c("DE", "not DE"),
+        n = c(length(sim_low_prob$de_genes), 1000 - length(sim_low_prob$de_genes))),
+    data.frame(scenario = "de_prob = 0.40",
+        type = c("DE", "not DE"),
+        n = c(length(sim_high_prob$de_genes), 1000 - length(sim_high_prob$de_genes)))
+)
+
+ggplot(de_df, aes(x = scenario, y = n, fill = type)) +
+    geom_col() +
+    scale_fill_manual(values = c("tomato", "grey70")) +
+    labs(y = "Number of genes", fill = NULL) +
+    theme_minimal()
+```
+
+### 3e. Sequencing depth between replicates (`replicate_effect`)
+
+Real experiments often have systematic differences in sequencing depth across replicates — one sample may have been sequenced more deeply than another, or RNA quality varied. The `replicate_effect` parameter in `simulate_counts()` introduces this by downsampling each replicate's library to a different depth. Setting it to 0 gives perfectly equal depth; larger values exaggerate the variation.
+
+> **Predict before you run:** How would systematic depth differences across replicates affect a DE test that does not account for library size?
+
+```{r}
+#| label: replicate-effect
+sim_no_effect = simulate_counts(n_genes = 1000, n_cells = 400, de_prob = 0.2, de_fc = 2, n_samples = 4, replicate_effect = 0)
+sim_strong_effect = simulate_counts(n_genes = 1000, n_cells = 400, de_prob = 0.2, de_fc = 2, n_samples = 4, replicate_effect = 0.2)
+
+real_lib_df = data.frame(
+    lib_size = colSums(counts),
+    batch = sci@meta.data$replicate,
+    scenario = "Real data"
+)
+median_order = real_lib_df %>%
+    group_by(batch) %>%
+    summarise(med = median(lib_size), .groups = "drop") %>%
+    arrange(desc(med)) %>%
+    pull(batch)
+
+lib_df = rbind(
+    data.frame(lib_size = colSums(sim_no_effect$counts), batch = sim_no_effect$metadata$replicate, scenario = "replicate_effect = 0"),
+    data.frame(lib_size = colSums(sim_strong_effect$counts), batch = sim_strong_effect$metadata$replicate, scenario = "replicate_effect = 0.2"),
+    real_lib_df
+)
+lib_df$scenario = factor(lib_df$scenario, levels = c("replicate_effect = 0", "replicate_effect = 0.2", "Real data"))
+lib_df$batch = factor(lib_df$batch, levels = c(paste0("Batch", 1:4), as.character(median_order)))
+
+ggplot(lib_df, aes(x = batch, y = lib_size)) +
+    geom_boxplot(fill = "steelblue", alpha = 0.5, outlier.shape = NA) +
+    scale_y_log10() +
+    facet_wrap(~ scenario, nrow = 1, scales = "free") +
+    labs(x = "Sample", y = "Library size (total UMI, log scale)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Interpret:** Does the real data show more variability in library size across replicates than the `replicate_effect = 0` simulation? What might cause this in practice?
+
+---
+
+## 4. QC & normalisation
+
+```{r}
+#| label: qc-metrics
+#| message: false
+sci[["pct_mt"]] = PercentageFeatureSet(sci, pattern = "^mt-")
+
+VlnPlot(sci,
+        features = c("nFeature_RNA", "nCount_RNA", "pct_mt"),
+        group.by = "label",
+        pt.size  = 0)
+```
+
+```{r}
+#| label: qc-filter
+sci = subset(sci, subset = nCount_RNA > 200 & nCount_RNA < 25000 & pct_mt < 20)
+```
+
+```{r}
+#| label: normalise
+#| message: false
+sci = NormalizeData(sci)
+sci = FindVariableFeatures(sci, nfeatures = 3000)
+sci = ScaleData(sci)
+sci = RunPCA(sci, npcs = 30)
+```
+
+---
+
+## 5. Harmony integration & UMAP
+
+```{r}
+#| label: harmony-umap
+#| fig-width: 14
+#| fig-height: 7
+sci = RunHarmony(sci, group.by.vars = "replicate")
+sci = RunUMAP(sci, reduction = "harmony", dims = 1:20)
+DimPlot(sci, group.by = c("label", "replicate"), ncol = 2) & coord_fixed()
+```
+
+---
+
+## 6. Cell type annotation
+
+```{r}
+#| label: clustering
+#| message: false
+#| fig-width: 18
+#| fig-height: 7
+sci = FindNeighbors(sci, reduction = "harmony", dims = 1:20)
+
+resolutions = c(0.2, 0.5, 1.0)
+for (res in resolutions) {
+    sci = FindClusters(sci, resolution = res, verbose = FALSE)
+}
+
+p_res_list = lapply(resolutions, function(res) {
+    DimPlot(sci, group.by = paste0("RNA_snn_res.", res), label = TRUE, label.size = 3, repel = TRUE) +
+        ggtitle(paste0("resolution = ", res)) +
+        coord_fixed() +
+        theme(legend.position = "none")
+})
+wrap_plots(p_res_list, nrow = 1)
+```
+
+```{r}
+#| label: load-annotation-clusters
+#| fig-width: 14
+#| fig-height: 7
+cluster_meta = readRDS(file.path(DATA_DIR, "sci-subset-no-annotation-clusters.rds"))
+sci_sub = sci[, sci@meta.data$barcode %in% cluster_meta$barcode]
+sci_sub$layer1 = as.factor(cluster_meta$layer1[match(sci_sub@meta.data$barcode, cluster_meta$barcode)])
+sci_sub$layer2 = as.factor(cluster_meta$layer2[match(sci_sub@meta.data$barcode, cluster_meta$barcode)])
+
+DimPlot(sci_sub, group.by = c("layer1", "layer2"), ncol = 2, label = TRUE, repel = TRUE) & coord_fixed()
+```
+
+```{r}
+#| label: marker-dotplot
+markers = list(
+    Neurons = c("Rbfox3", "Snap25", "Syt1", "Tubb3"),
+    Astroependymal = c("Gfap", "Aldh1l1", "Slc1a3", "Sox9"),
+    `Immune cells` = c("Cx3cr1", "P2ry12", "Tmem119", "Ptprc"),
+    Oligodendrocytes = c("Mbp", "Plp1", "Mog"),
+    `Vascular cells` = c("Cldn5", "Pecam1", "Acta2", "Tie1")
+)
+
+dot_data = lapply(names(markers), function(ct) {
+    dp = DotPlot(sci_sub, features = markers[[ct]], group.by = "layer1")$data
+    dp$marker_group = ct
+    dp
+})
+dot_df = do.call(rbind, dot_data)
+dot_df$marker_group = factor(dot_df$marker_group, levels = names(markers))
+dot_df = dot_df %>%
+    group_by(marker_group) %>%
+    mutate(pct_scaled = (pct.exp - min(pct.exp)) / (max(pct.exp) - min(pct.exp))) %>%
+    ungroup()
+
+ggplot(dot_df, aes(x = features.plot, y = id, size = pct_scaled, colour = avg.exp.scaled)) +
+    geom_point() +
+    scale_colour_gradient2(low = "steelblue", mid = "white", high = "tomato", name = "Scaled\nexpr") +
+    scale_size_continuous(range = c(0, 6), name = "% cells\n(scaled per group)") +
+    facet_grid(~ marker_group, scales = "free_x", space = "free_x") +
+    theme_minimal() +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        strip.text = element_text(face = "bold", size = 9),
+        panel.spacing = unit(0.3, "lines"),
+        panel.border = element_rect(colour = "grey80", fill = NA)
+    ) +
+    labs(x = NULL, y = "Cluster (layer1)")
+```
+
+```{r}
+#| label: annotate-clusters
+#| fig-width: 10
+#| fig-height: 14
+layer1_map = c(
+    "1" = "Neurons",
+    "2" = "Vascular cells",
+    "3" = "Astroependymal cells",
+    "4" = "Immune cells",
+    "5" = "Oligodendrocytes"
+)
+layer2_map = c(
+    "1"  = "OPC",
+    "2"  = "Dorsal neurons",
+    "3"  = "Vascular cells",
+    "4"  = "Ventral neurons",
+    "5"  = "Vascular endothelial cells",
+    "6"  = "Ependymal cells",
+    "7"  = "Astrocytes",
+    "8"  = "Peripheral immune cells",
+    "9"  = "Microglia",
+    "10" = "NFOL",
+    "11" = "MOL"
+)
+
+sci_sub$cell_type_broad = unname(layer1_map[as.character(sci_sub$layer1)])
+sci_sub$cell_type = unname(layer2_map[as.character(sci_sub$layer2)])
+
+DimPlot(sci_sub, group.by = c("cell_type_broad", "cell_type"), ncol = 1, label = TRUE, repel = TRUE, label.size = 3) & coord_fixed()
+```
+
+::: {.callout-warning}
+## CHECKPOINT
+Does the UMAP make biological sense? Which clusters surprise you?
+
+- Are injury-associated cell states separating from homeostatic ones?
+- Do you see expected cell types for spinal cord tissue?
+- Which cluster would you investigate further and why?
+:::
+
+---
+
+## 7. Cell type proportions — Sankey plot
+
+```{r}
+#| label: sankey-plot
+label_levels = c("uninjured", "young", "old")
+
+prop_df = sci_sub@meta.data %>%
+    filter(!is.na(cell_type), label %in% label_levels) %>%
+    mutate(label = factor(label, levels = label_levels)) %>%
+    group_by(label, cell_type) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(label) %>%
+    mutate(prop = n / sum(n)) %>%
+    ungroup() %>%
+    tidyr::complete(label, cell_type, fill = list(n = 0, prop = 0))
+
+ggplot(prop_df,
+       aes(x = label, y = prop, alluvium = cell_type, stratum = cell_type, fill = cell_type)) +
+    geom_flow(alpha = 0.7) +
+    geom_stratum() +
+    theme_minimal() +
+    labs(y = "Proportion", x = "Condition", fill = "Cell type")
+```
+
+---
+
+## 8. What single-cell resolution gives you
+
+Bulk RNA-seq averages expression across every cell in a tissue sample. A gene upregulated in microglia but downregulated in neurons would appear unchanged — the signals cancel. Single-cell sequencing resolves this by profiling each cell independently.
+
+The Sankey plot above makes this concrete. Cell type **composition** shifts substantially between uninjured and injured spinal cord: immune populations expand, oligodendrocyte lineage cells respond, vascular cells reorganize. None of these compositional changes are visible in a bulk experiment — you see only a noisy average over a moving mixture.
+
+This resolution is what makes Notebook 2 possible. Instead of asking *"which genes change in the injured spinal cord?"*, we can ask *"which genes change specifically in microglia, in astrocytes, in OPCs?"* — questions that bulk DE cannot answer.
+
+```{r}
+#| label: save-annotated
+saveRDS(sci_sub, file.path(DATA_DIR, "sci-subset-annotated.rds"))
+```
