@@ -1,0 +1,13 @@
+# Data lives in the shared project dir (PROJ_DIR), not in git
+data/
+results/
+figures/
+
+# Quarto/R render artifacts
+*.html
+*_files/
+*.rmarkdown
+.quarto/
+/.Rproj.user
+.Rhistory
+.RData

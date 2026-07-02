@@ -25,7 +25,8 @@ library(sparseMatrixStats)
 PROJ_DIR <- ""   # set this to your project path, e.g. "/shared/projects/.../projects/C10"
 DATA_DIR <- file.path(PROJ_DIR, "data")
 FIG_DIR  <- file.path(PROJ_DIR, "figures")
-source(file.path(PROJ_DIR, "setup-quarto-visualization.R"))
+GIT_DIR  <- ""   # set this to your git checkout path, e.g. "~/cajal-project-alan"
+source(file.path(GIT_DIR, "setup-quarto-visualization.R"))
 ```
 
 ```{r}
