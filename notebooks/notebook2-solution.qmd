@@ -1,0 +1,216 @@
+---
+title: "Notebook 2 — Pseudobulk DE & GO Analysis (Solutions)"
+subtitle: "CAJAL Neuromics 2026 · Spinal Cord Injury"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(Seurat)
+library(edgeR)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(sparseMatrixStats)
+
+PROJ_DIR <- "/shared/projects/tp_2630_ubordeaux_neuromics_184418/projects/C14/"   # set this to your project path, e.g. "/shared/projects/.../projects/C10"
+DATA_DIR <- file.path(PROJ_DIR, "data")
+FIG_DIR  <- file.path(PROJ_DIR, "figures")
+GIT_DIR  <- "~/cajal-project-alan"   # set this to your git checkout path, e.g. "~/cajal-project-alan"
+source(file.path(GIT_DIR, "setup-quarto-visualization.R"))
+```
+
+```{r}
+#| label: load-data
+sci_sub = readRDS(file.path(DATA_DIR, "sci-subset-atlas-annotated.rds"))
+sci_sub$cell_type = sci_sub$layer2
+```
+
+---
+
+## From composition change to cell-type-specific DE
+
+In Notebook 1, you showed that spinal cord injury shifts the **composition** of cell types. But composition change is only one half of the story. The other half: **within each cell type, which genes change?**
+
+A gene driving microglial activation is biologically distinct from one driving astrocyte reactivity — even if both appear as "upregulated in injured tissue" in a bulk experiment. Single-cell resolution lets us separate these signals.
+
+The correct unit of replication is the biological replicate (animal), not the cell — testing gene by gene across individual cells inflates significance because cells from the same animal share correlated expression. `Libra::run_de` avoids this by aggregating counts per (cell type × replicate) into a **pseudobulk** profile, then running a bulk DE method (edgeR) on those profiles.
+
+---
+
+## 1. Pseudobulk DE on real SCI data
+
+`Libra::run_de` runs pseudobulk edgeR per cell type. We run all three pairwise comparisons across all cell types and collect results into a single data frame with a `comparison` column.
+
+```{r}
+#| label: real-de-celltypes
+# Cell type sizes across all conditions
+sort(table(sci_sub$cell_type), decreasing = TRUE)
+```
+
+```{r}
+#| label: real-de
+comparisons = list(
+    "young_vs_uninjured" = c("young", "uninjured"),
+    "young_vs_old" = c("young", "old"),
+    "uninjured_vs_old" = c("uninjured", "old")
+)
+
+de_res = lapply(setNames(names(comparisons), names(comparisons)), function(comp) {
+    conds = comparisons[[comp]]
+    sub = sci_sub[, sci_sub$label %in% conds]
+    res = Libra::run_de(sub, cell_type_col = "cell_type", label_col = "label", replicate_col = "replicate")
+    res$sig = res$p_val_adj < 0.05 & abs(res$avg_logFC) > 1
+    res
+})
+```
+
+```{r}
+#| label: real-de-volcanoes
+#| fig-width: 18
+#| fig-height: 10
+# Sig gene counts per cell type × comparison
+sig_counts = do.call(rbind, lapply(names(de_res), function(comp) {
+    agg = aggregate(sig ~ cell_type, data = de_res[[comp]], FUN = sum)
+    agg$comparison = comp
+    agg
+}))
+sig_counts$comparison = factor(sig_counts$comparison, levels = names(comparisons))
+
+ggplot(sig_counts, aes(x = reorder(cell_type, -sig), y = sig, fill = comparison)) +
+    geom_col(position = "dodge") +
+    scale_fill_brewer(palette = "Set2") +
+    labs(x = NULL, y = "Significant DE genes (FDR < 0.05, |log2FC| > 1)", fill = NULL) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Volcano plots for young_vs_uninjured — top 6 cell types by sig gene count
+yvu = sig_counts[sig_counts$comparison == "young_vs_uninjured", ]
+top_cts = head(yvu$cell_type[order(-yvu$sig)], 6)
+
+plots = lapply(top_cts, function(ct) {
+    df = de_res[["young_vs_uninjured"]]
+    df = df[df$cell_type == ct, ]
+    ggplot(df, aes(x = avg_logFC, y = -log10(p_val_adj), colour = sig)) +
+        geom_point(alpha = 0.6, size = 0.6) +
+        scale_colour_manual(values = c("grey70", "tomato")) +
+        geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+        labs(title = ct, x = "log2FC", y = "-log10(FDR)") +
+        theme_minimal() +
+        theme(legend.position = "none")
+})
+patchwork::wrap_plots(plots, ncol = 3)
+
+# Top hits for most perturbed cell type (young vs uninjured)
+top_ct = top_cts[1]
+cat("\n--- Top hits:", top_ct, "(young vs uninjured) ---\n")
+df = de_res[["young_vs_uninjured"]]
+df = df[df$cell_type == top_ct & df$sig, ]
+print(head(df[order(-abs(df$avg_logFC)), c("gene", "avg_logFC", "p_val_adj")], 10))
+```
+
+**Explore:** Which cell types respond most strongly to injury? Do the same cell types rank highly across all three comparisons, or does the pattern differ between young and old injury?
+
+**Explore:** Which cell type shows the most DE genes across all three comparisons (young vs uninjured, young vs old, uninjured vs old)? Is the response cell-type-specific or broadly shared? What does this pattern tell you about the injury response relative to aging?
+
+Microglia and astrocytes typically dominate, pointing to neuroinflammation as a major driver. If the young vs uninjured comparison has far more DE genes than old vs uninjured, it suggests the acute injury response is dampened by aging, which has implications for regenerative capacity.
+
+---
+
+## 2. GO enrichment
+
+Build the GO BP gene sets from `org.Mm.eg.db` once, then pass them directly to `enricher` and `GSEA` — this avoids re-querying the database on every call.
+
+```{r}
+#| label: go-build-sets
+go_ann = AnnotationDbi::select(
+    org.Mm.eg.db,
+    keys = keys(org.Mm.eg.db, "SYMBOL"),
+    columns = c("SYMBOL", "GO", "ONTOLOGY"),
+    keytype = "SYMBOL"
+)
+go_ann = go_ann[!is.na(go_ann$GO) & go_ann$ONTOLOGY == "BP", ]
+
+go_t2g = unique(go_ann[, c("GO", "SYMBOL")])
+go_t2n = unique(AnnotationDbi::select(
+    GO.db::GO.db, keys = unique(go_t2g$GO), columns = "TERM", keytype = "GOID"
+)[, c("GOID", "TERM")])
+names(go_t2g) = c("term", "gene")
+names(go_t2n) = c("term", "name")
+```
+
+```{r}
+#| label: go-analysis
+#| fig-width: 10
+#| fig-height: 8
+ct_for_go = top_cts[1]
+comp_for_go = "young_vs_uninjured"
+de_go = de_res[[comp_for_go]][de_res[[comp_for_go]]$cell_type == ct_for_go, ]
+sig_genes = de_go$gene[de_go$p_val_adj < 0.05 & de_go$avg_logFC > 0]
+
+ego = enricher(
+    gene = sig_genes,
+    universe = de_go$gene,
+    TERM2GENE = go_t2g,
+    TERM2NAME = go_t2n,
+    pAdjustMethod = "BH"
+)
+
+dotplot(ego, showCategory = 20) +
+    labs(title = paste("GO enrichment —", ct_for_go, "(upregulated in", comp_for_go, ")"))
+```
+
+**Explore:** What biological processes come up? Do they match your expectations for this cell type after injury?
+
+---
+
+## 3. GSEA
+
+GO ORA only uses genes that pass a threshold. GSEA uses the **full ranked list** — every gene gets a fold change score, and the algorithm asks whether genes in a pathway cluster near the top or bottom. This is more sensitive and doesn't require an arbitrary cutoff.
+
+```{r}
+#| label: gsea
+#| fig-width: 10
+#| fig-height: 8
+ct_for_gsea = top_cts[1]
+comp_for_gsea = "young_vs_uninjured"
+de_ct = de_res[[comp_for_gsea]][de_res[[comp_for_gsea]]$cell_type == ct_for_gsea, ]
+gene_list = sort(setNames(de_ct$avg_logFC, de_ct$gene), decreasing = TRUE)
+
+gsea_res = GSEA(
+    geneList = gene_list,
+    TERM2GENE = go_t2g,
+    TERM2NAME = go_t2n,
+    minGSSize = 15,
+    maxGSSize = 500,
+    pAdjustMethod = "BH",
+    verbose = FALSE
+)
+
+dotplot(gsea_res, showCategory = 15, split = ".sign") +
+    facet_grid(. ~ .sign)
+```
+
+**Explore:** Do the GSEA results agree with GO? Are there pathways that GSEA picks up that ORA missed, or vice versa? What does the direction (activated vs suppressed) tell you about the biology?
+
+**Explore:** Pick one enriched GO term from your results. Look up 2–3 of the genes driving it. Are any already known SCI or neuroinflammation markers? Does the unbiased GO analysis confirm or surprise you?
+
+Many top GO terms in microglia after SCI involve complement activation, phagocytosis, and cytokine signalling — genes like C1q, Trem2, and Il1b are established SCI markers. Finding them through an unbiased pathway analysis validates the approach and confirms the data quality.
+
+---
+
+::: {.callout-warning}
+## CHECKPOINT
+Which cell type has the most DE genes? Are the responses cell-type-specific or shared?
+
+- What do GO and GSEA together suggest about what is happening in your chosen cell type after injury?
+:::
