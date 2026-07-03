@@ -1,0 +1,389 @@
+---
+title: "Notebook 2 (Extended) — Pseudobulk DE & GO Analysis"
+subtitle: "CAJAL Neuromics 2026 · Spinal Cord Injury"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(Seurat)
+library(edgeR)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(splatter)
+library(sparseMatrixStats)
+
+PROJ_DIR <- "/shared/projects/tp_2630_ubordeaux_neuromics_184418/projects/C14/"   # set this to your project path, e.g. "/shared/projects/.../projects/C10"
+DATA_DIR <- file.path(PROJ_DIR, "data")
+FIG_DIR  <- file.path(PROJ_DIR, "figures")
+GIT_DIR  <- "~/cajal-project-alan"   # set this to your git checkout path, e.g. "~/cajal-project-alan"
+source(file.path(GIT_DIR, "setup-quarto-visualization.R"))
+```
+
+```{r}
+#| label: load-data
+sci_sub = readRDS(file.path(DATA_DIR, "sci-subset-atlas-annotated.rds"))
+sci_sub$cell_type = sci_sub$layer2
+```
+
+---
+
+## From composition change to cell-type-specific DE
+
+In Notebook 1, you showed that spinal cord injury shifts the **composition** of cell types. But composition change is only one half of the story. The other half: **within each cell type, which genes change?**
+
+A gene driving microglial activation is biologically distinct from one driving astrocyte reactivity — even if both appear as "upregulated in injured tissue" in a bulk experiment. Single-cell resolution lets us separate these signals.
+
+The most natural starting point is Seurat's built-in `FindMarkers`, which applies a Wilcoxon rank-sum test cell by cell. Let's try it first.
+
+---
+
+## 1. Seurat Wilcoxon test
+
+`FindMarkers` is Seurat's default DE function. It tests each gene using a Wilcoxon rank-sum test, treating every cell as an independent observation.
+
+```{r}
+#| label: subset-microglia
+mg = sci_sub[, sci_sub$cell_type == "Microglia" & sci_sub$label %in% c("young", "uninjured")]
+mg = NormalizeData(mg)
+Idents(mg) = mg$label
+```
+
+```{r}
+#| label: wilcox-de
+#| eval: false
+# Run FindMarkers with test.use = "wilcox" on mg (young vs uninjured)
+# Use logfc.threshold = 0 and min.pct = 0.01 to get all genes
+# Add a $gene column and a $sig column (FDR < 0.05 & |log2FC| > 1)
+# Volcano plot: avg_log2FC on x, -log10(p_val_adj) on y, colour by sig
+
+
+
+```
+
+**Interpret:** How many genes are called significant? Does this number seem plausible given what you know about microglial activation after injury?
+
+---
+
+## 2. The problem with cell-level tests
+
+The number of significant genes in section 1 looks high. Is it real, or is the test calling too many? We can answer this directly using simulated data where we control the ground truth — we know exactly which genes are truly DE and which are not.
+
+We generate two scenarios:
+
+- **Null**: no DE genes at all (`de_prob = 0`) — any significant hit is a false positive
+- **DE**: 10% of genes are truly DE (`de_prob = 0.1`) — we can compare discovered genes against the known truth
+
+```{r}
+#| label: sim-generate
+#| eval: false
+# Generate two simulated datasets with simulate_counts():
+# sim_null: n_genes=1000, n_cells=500, de_prob=0, n_samples=6
+# sim_de:   n_genes=1000, n_cells=500, de_prob=0.1, de_fc=2, n_samples=6
+# Use set.seed(42)
+
+
+```
+
+```{r}
+#| label: sim-visualise
+#| eval: false
+# Build null_df: first gene of sim_null, columns expr / label / replicate
+# Build de_df:   first DE gene of sim_de (sim_de$de_genes[1])
+# Boxplot each on log scale (scale_y_log10), fill by label
+# Combine with patchwork
+
+
+```
+
+Now run the Wilcoxon test cell-by-cell on both simulations:
+
+```{r}
+#| label: wilcox-on-sims
+#| eval: false
+# Create Seurat objects from sim_null and sim_de, NormalizeData, set Idents to label
+# Run FindMarkers (wilcox, logfc.threshold=0, min.pct=0) on each
+# Store adj p-values as padj_null and padj_de (named by gene)
+# Plot histogram of padj_null — should be uniform under the null
+# Hint: add a dashed line at expected count (n_genes/n_bins) to judge calibration
+# Print: false discoveries under null, TP/FP counts for sim_de
+
+
+```
+
+**Interpret:** How many false discoveries does the Wilcoxon produce under the null? How does the number of significant genes in the DE simulation compare to the true number of DE genes?
+
+The reason: cells from the same animal share a common random effect on expression. Treating them as independent observations inflates the effective sample size, deflates p-values, and produces far too many significant hits. The correct unit of replication is the **biological replicate** (animal), not the cell. The fix is to aggregate counts per replicate before testing — **pseudobulk**.
+
+---
+
+## 3. Pseudobulk aggregation
+
+Pseudobulk collapses all cells from the same cell type and replicate into a single count vector by summing raw counts. This gives one "sample" per (cell type × replicate) combination — exactly the input a bulk DE method like edgeR expects.
+
+```{r}
+#| label: pseudobulk-fn
+make_pseudobulk = function(seurat_obj, cell_type, group_vars = c("replicate", "label")) {
+    sub = seurat_obj[, seurat_obj@meta.data$cell_type == cell_type]
+    counts = as(GetAssayData(sub, layer = "counts"), "dgCMatrix")
+    meta = sub@meta.data[, group_vars, drop = FALSE]
+
+    replicates = unique(meta$replicate)
+    pb = sapply(replicates, function(r) {
+        idx = which(meta$replicate == r)
+        rowSums(counts[, idx, drop = FALSE])
+    })
+
+    sample_meta = meta[match(replicates, meta$replicate), ]
+    rownames(sample_meta) = replicates
+
+    edgeR::DGEList(counts = pb, samples = sample_meta)
+}
+```
+
+---
+
+## 4. Simulation experiment 1 — FDR under the null
+
+We already have Wilcoxon results for `sim_null` from section 2 (`padj_null`). Now run edgeR pseudobulk on the same data and compare how many false positives each method produces when there is no true DE signal.
+
+```{r}
+#| label: sim-exp1-fdr
+#| eval: false
+# Aggregate sim_null counts into pseudobulk by replicate (rowSums per replicate)
+# Run edgeR pipeline: DGEList -> calcNormFactors -> model.matrix(~ label)
+#   -> estimateDisp -> glmFit -> glmLRT -> topTags(n=Inf)
+# Align edgeR FDR to gene order of padj_null
+# Faceted histogram comparing adj-p distributions (Wilcoxon vs edgeR)
+# Print: false discoveries for each method (FDR < 0.05)
+
+
+```
+
+**Interpret:** Which method produces more false discoveries? If Wilcoxon inflates FDR here, what does it tell you about using it on real data?
+
+---
+
+## 5. Simulation experiment 2 — gene ranking quality (AUPRC)
+
+Controlling FDR is necessary but not sufficient. We also care about **ranking**: does the method place true DE genes near the top of the list? Area under the precision-recall curve (AUPRC) measures this. We already have Wilcoxon results for `sim_de` (`padj_de`); now run edgeR pseudobulk on the same data.
+
+```{r}
+#| label: sim-exp1-auprc
+#| eval: false
+# Repeat the edgeR pipeline on sim_de (pb_de, dge_de, edger_de_res)
+# Add is_de column: TRUE if gene is in sim_de$de_genes
+# Compute PRC for edgeR and Wilcoxon using compute_prc(-log10(FDR+1e-300), is_de)
+# Plot precision-recall curves with geom_line, add horizontal baseline
+# Print AUPRC for each method
+
+
+```
+
+**Interpret:** Which method better separates true DE genes from nulls in its ranking? What does it mean if a method has a high AUPRC but poor FDR control (or vice versa)?
+
+---
+
+## 6. Simulation experiment 3 — why biological replicates matter
+
+Wilcoxon ignores which cells came from which animal — it treats every cell as an independent observation. Pseudobulk respects the replicate structure by aggregating first. To show why this matters, we can break that structure on purpose: shuffle the replicate labels within each condition so that pseudobulk now gets random cell mixtures instead of real biological replicates. We reuse `sim_de` from section 2.
+
+```{r}
+#| label: sim-exp3
+#| eval: false
+# Shuffle replicate labels within each condition in sim_de$metadata (set.seed(42))
+# Run edgeR pseudobulk on the shuffled version (same pipeline as sim-exp1-fdr)
+# Compare real vs shuffled: stacked bar showing TP and FP counts
+# Hint: real_sig and shuf_sig are genes with FDR < 0.05; check overlap with sim_de$de_genes
+
+
+```
+
+**Interpret:** What happens to the number of significant genes when replicate labels are shuffled? Why can't you recover statistical power by simply splitting cells into more artificial replicates?
+
+---
+
+## 7. Pseudobulk DE on real SCI data
+
+`Libra::run_de` runs pseudobulk edgeR per cell type. We run all three pairwise comparisons across all cell types and collect results into a single data frame with a `comparison` column.
+
+```{r}
+#| label: real-de-celltypes
+#| eval: false
+# Show cell type sizes across all conditions
+# Hint: sort(table(sci_sub$cell_type), decreasing=TRUE)
+
+
+```
+
+```{r}
+#| label: real-de
+#| eval: false
+# Define comparisons as a named list: young_vs_uninjured, young_vs_old, uninjured_vs_old
+# For each comparison: subset sci_sub to those two conditions, run Libra::run_de,
+#   add a $comparison column, rbind all results into de_res
+# Add a $sig column (p_val_adj < 0.05 & |avg_logFC| > 1)
+
+
+```
+
+```{r}
+#| label: real-de-volcanoes
+#| eval: false
+# 1. Bar chart: sig gene counts per cell type × comparison
+#    aggregate(sig ~ cell_type + comparison, de_res, sum)
+#    geom_col(position="dodge") + reorder cell_type by total sig genes
+# 2. Identify top 6 cell types by sig count in young_vs_uninjured (store as top_cts)
+# 3. Volcano plots for those 6 cell types (young_vs_uninjured only), wrap_plots(ncol=3)
+# 4. Print top 10 hits for top_cts[1]
+
+
+```
+
+**Explore:** Which cell types respond most strongly to injury? Do the same cell types rank highly across all three comparisons, or does the pattern differ between young and old injury?
+
+**Explore:** Which cell type shows the most DE genes across all three comparisons (young vs uninjured, young vs old, uninjured vs old)? Is the response cell-type-specific or broadly shared? What does this pattern tell you about the injury response relative to aging?
+
+---
+
+## 7b. Wilcoxon vs pseudobulk — Microglia
+
+We already ran Wilcoxon on Microglia in section 1 (`markers_wilcox`). Pseudobulk edgeR is now in `de_res`. How different are the two gene lists?
+
+```{r}
+#| label: wilcox-vs-pb
+#| eval: false
+# Filter de_res to Microglia & comparison == "young_vs_uninjured"
+# Align with markers_wilcox on shared genes
+# Scatter plot: -log10(adj.p) Wilcoxon vs pseudobulk; annotate Spearman r
+# Count overlap: Wilcoxon-only hits likely false positives
+
+
+```
+
+**Interpret:** Do the two methods agree on fold change direction? Where do they diverge — is it mostly Wilcoxon calling extra genes, or are there genes pseudobulk finds that Wilcoxon misses?
+
+---
+
+## 8. GO enrichment
+
+Build the GO BP gene sets from `org.Mm.eg.db` once, then pass them directly to `enricher` and `GSEA` — this avoids re-querying the database on every call.
+
+```{r}
+#| label: go-build-sets
+#| eval: false
+# Build GO BP gene sets from org.Mm.eg.db once:
+# go_ann = AnnotationDbi::select(org.Mm.eg.db, keys=..., columns=c("SYMBOL","GO","ONTOLOGY"), ...)
+# Filter to ONTOLOGY == "BP", build go_t2g (term, gene) and go_t2n (term, name) tables
+
+
+```
+
+```{r}
+#| label: go-analysis
+#| eval: false
+# Use top_cts[1] and comparison "young_vs_uninjured"
+# sig_genes: upregulated genes (avg_logFC > 0 & p_val_adj < 0.05) for that ct × comparison
+# enricher(gene=sig_genes, universe=all genes for that ct × comparison, TERM2GENE=go_t2g, TERM2NAME=go_t2n)
+# dotplot(ego, showCategory=20)
+
+
+```
+
+**Explore:** What biological processes come up? Do they match your expectations for this cell type after injury?
+
+---
+
+## 9. GSEA
+
+GO ORA only uses genes that pass a threshold. GSEA uses the **full ranked list** — every gene gets a fold change score, and the algorithm asks whether genes in a pathway cluster near the top or bottom. This is more sensitive and doesn't require an arbitrary cutoff.
+
+```{r}
+#| label: gsea
+#| eval: false
+# Filter de_res to top_cts[1] & "young_vs_uninjured"
+# Build a named gene list: log2FC values sorted decreasing (all genes, no threshold)
+# Hint: sort(setNames(de_ct$avg_logFC, de_ct$gene), decreasing=TRUE)
+# GSEA(geneList=gene_list, TERM2GENE=go_t2g, TERM2NAME=go_t2n, minGSSize=15, maxGSSize=500)
+# dotplot(gsea_res, showCategory=15, split=".sign") + facet_grid(. ~ .sign)
+
+
+```
+
+**Explore:** Do the GSEA results agree with GO? Are there pathways that GSEA picks up that ORA missed, or vice versa? What does the direction (activated vs suppressed) tell you about the biology?
+
+**Explore:** Pick one enriched GO term from your results. Look up 2–3 of the genes driving it. Are any already known SCI or neuroinflammation markers? Does the unbiased GO analysis confirm or surprise you?
+
+---
+
+::: {.callout-warning}
+## CHECKPOINT
+Which cell type has the most DE genes? Are the responses cell-type-specific or shared?
+
+- How different are the Wilcoxon hits (section 1) from the pseudobulk hits (section 7)?
+- What do GO and GSEA together suggest about what is happening in your chosen cell type after injury?
+:::
+
+---
+
+## Challenge: Apply to your own data
+
+Find a publicly available scRNA-seq dataset with **at least two conditions** and **biological replicates**, then apply the pseudobulk DE + GO/GSEA pipeline from this notebook to it.
+
+### Where to find data
+
+- **GEO** (`ncbi.nlm.nih.gov/geo`) — search `scRNA-seq [tissue or disease]`; look for papers that deposit processed Seurat `.rds` objects or count matrices
+- **CELLxGENE** (`cellxgene.cziscience.com`) — downloadable `.h5ad` files (use `SeuratDisk::Convert` or `sceasy` to load in R)
+- **Zenodo / figshare** — many papers deposit Seurat objects directly alongside their publication
+
+### What your dataset needs
+
+| Metadata column | Content |
+|---|---|
+| `label` | Condition per cell (e.g. `"treatment"`, `"control"`) |
+| `replicate` | Biological replicate ID (required by `Libra`) |
+| `cell_type` | Cell type annotation |
+
+### Tasks
+
+1. Load the dataset as a Seurat object and inspect its metadata — confirm `label`, `replicate`, and `cell_type` columns exist (or rename them).
+2. Choose one pairwise comparison and run `Libra::run_de()`.
+3. Visualise significant genes per cell type as a bar chart.
+4. Pick one cell type with many sig genes and run GO enrichment (`enricher`).
+5. Run GSEA on the full ranked gene list for the same cell type.
+6. Do the enriched pathways make biological sense for your system?
+
+```{r}
+#| label: byod-nb2
+#| eval: false
+# Load your dataset
+# obj = readRDS(file.path(PROJ_DIR, "your-dataset.rds"))
+
+# Check metadata
+# table(obj$label)
+# table(obj$replicate)
+# table(obj$cell_type)
+
+# Pseudobulk DE (same pattern as section 7)
+# de = lapply(setNames("cond1_vs_cond2", "cond1_vs_cond2"), function(comp) {
+#     conds = c("cond1", "cond2")
+#     sub = obj[, obj$label %in% conds]
+#     res = Libra::run_de(sub, cell_type_col = "cell_type",
+#                         label_col = "label", replicate_col = "replicate")
+#     res$sig = res$p_val_adj < 0.05 & abs(res$avg_logFC) > 1
+#     res
+# })
+
+# GO + GSEA (same pattern as sections 8 and 9)
+```
+
+**What did you find?** Write 3–4 sentences summarising the top enriched pathways and whether they match what is known about your biological system.

@@ -23,10 +23,10 @@ library(Vespucci)
 library(tidyverse)
 library(randomForest)
 
-PROJ_DIR <- ""   # set this to your project path, e.g. "/shared/projects/.../projects/C10"
+PROJ_DIR <- "/shared/projects/tp_2630_ubordeaux_neuromics_184418/projects/C14/"   # set this to your project path, e.g. "/shared/projects/.../projects/C10"
 DATA_DIR <- file.path(PROJ_DIR, "data")
 FIG_DIR  <- file.path(PROJ_DIR, "figures")
-GIT_DIR  <- ""   # set this to your git checkout path, e.g. "~/cajal-project-alan"
+GIT_DIR  <- "~/cajal-project-alan"   # set this to your git checkout path, e.g. "~/cajal-project-alan"
 source(file.path(GIT_DIR, "setup-quarto-visualization.R"))
 ```
 

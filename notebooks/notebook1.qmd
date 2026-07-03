@@ -24,10 +24,10 @@ library(org.Mm.eg.db)
 library(splatter)
 library(sparseMatrixStats)
 
-PROJ_DIR <- ""   # set this to your project path, e.g. "/shared/projects/.../projects/C10"
+PROJ_DIR <- "/shared/projects/tp_2630_ubordeaux_neuromics_184418/projects/C14/"   # set this to your project path, e.g. "/shared/projects/.../projects/C10"
 DATA_DIR <- file.path(PROJ_DIR, "data")
 FIG_DIR  <- file.path(PROJ_DIR, "figures")
-GIT_DIR  <- ""   # set this to your git checkout path, e.g. "~/cajal-project-alan"
+GIT_DIR  <- "~/cajal-project-alan"   # set this to your git checkout path, e.g. "~/cajal-project-alan"
 source(file.path(GIT_DIR, "setup-quarto-visualization.R"))
 ```
 
@@ -59,7 +59,23 @@ counts = GetAssayData(sci, layer = "counts")
 # Hint: sample() cell indices; extract non-zero values via the @x slot of the sparse matrix
 # Use set.seed(42) for reproducibility
 
+sim_poisson = simulate_counts_naive("poisson", n_genes = 500, n_cells = 100)
+sim_gaussian = simulate_counts_naive("gaussian", n_genes = 500, n_cells = 100)
+sim_nb = simulate_counts_naive("nb", n_genes = 500, n_cells = 100)
 
+counts_df = rbind(
+    data.frame(x = sim_gaussian[sim_gaussian > 0], model = "Gaussian"),
+    data.frame(x = sim_poisson[sim_poisson > 0], model = "Poisson"),
+    data.frame(x = sim_nb[sim_nb > 0], model = "NB")
+)
+counts_df$model = factor(counts_df$model, levels = c("Gaussian", "Poisson", "NB"))
+
+ggplot(counts_df, aes(x = x)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 40, fill = "steelblue", colour = "white", alpha = 0.4) +
+    scale_x_log10() +
+    facet_wrap(~ model, nrow = 1) +
+    labs(x = "Count (log scale)", y = "Density") +
+    theme_minimal()
 # Combine p1 + p2 with patchwork
 
 ```
@@ -183,18 +199,12 @@ n_cells_demo = 80
 base_mean = 5
 de_fc_demo = 2
 
-# 3 Control replicates, 3 Treated replicates
 group_demo = c(rep("Control", 3), rep("Treated", 3))
 group_fc = c(rep(1, 3), rep(de_fc_demo, 3))
+sample_effects = exp(rnorm(n_samples_demo, mean = 0, sd = 0.5))
 
-# Each replicate has a random multiplicative effect on mean expression
-# Hint: use exp(rnorm(...)) to generate log-normal sample effects
-sample_effects = ___
-
-# For each replicate, simulate NB counts with mu = base_mean * sample_effect * group_fc
-# size = 1 (overdispersed), n_cells_demo cells per replicate
 cells_list = lapply(seq_len(n_samples_demo), function(i) {
-    mu_i = ___
+    mu_i = base_mean * sample_effects[i] * group_fc[i]
     data.frame(
         count = rnbinom(n_cells_demo, size = 1, mu = mu_i),
         replicate = paste0("S", i),
@@ -204,11 +214,34 @@ cells_list = lapply(seq_len(n_samples_demo), function(i) {
 cells_df = do.call(rbind, cells_list)
 cells_df$replicate = factor(cells_df$replicate)
 
-# p_pooled: density histogram of count+1, coloured by group, all replicates merged
-p_pooled = ___
+p_pooled = ggplot(cells_df, aes(x = count + 1, fill = group, colour = group)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 40, position = "identity", alpha = 0.3, colour = "white") +
+    geom_density(alpha = 0) +
+    scale_x_log10() +
+    scale_fill_manual(values = c("steelblue", "tomato")) +
+    scale_colour_manual(values = c("steelblue", "tomato")) +
+    labs(
+        title = "Pooled (ignoring replicates)",
+        subtitle = "Broad mixture — extra width is replicate noise,\nnot biology",
+        x = "Count + 1 (log scale)", y = "Density", fill = "Group"
+    ) +
+    guides(colour = "none") +
+    theme_minimal()
 
-# p_per_sample: same but faceted by replicate (nrow = 2)
-p_per_sample = ___
+p_per_sample = ggplot(cells_df, aes(x = count + 1, fill = group, colour = group)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 25, colour = "white", alpha = 0.3) +
+    geom_density(alpha = 0) +
+    scale_x_log10() +
+    scale_fill_manual(values = c("steelblue", "tomato")) +
+    scale_colour_manual(values = c("steelblue", "tomato")) +
+    facet_wrap(~ replicate, nrow = 2) +
+    labs(
+        title = "Per replicate",
+        subtitle = "Each replicate follows a tight NB —\nbut means shift between replicates",
+        x = "Count + 1 (log scale)", y = "Density", fill = "Group"
+    ) +
+    guides(colour = "none") +
+    theme_minimal()
 
 p_pooled + p_per_sample + plot_layout(widths = c(1, 2))
 ```
@@ -428,18 +461,38 @@ Choose 3–4 canonical marker genes for each of the 5 layer1 cell types and buil
 #| eval: false
 # Define your marker gene lists — one entry per layer1 cell type
 markers = list(
-    Neurons = c(___),
-    Astroependymal = c(___),
-    `Immune cells` = c(___),
-    Oligodendrocytes = c(___),
-    `Vascular cells` = c(___)
+    Neurons = c('Rbfox3')
+    # Astroependymal = c(),
+    # `Immune cells` = c(),
+    # Oligodendrocytes = c(),
+    # `Vascular cells` = c()
 )
 
-# Extract DotPlot data per marker group, combine, and scale pct.exp within each group
-# Hint: DotPlot(sci_sub, features = markers[[ct]], group.by = "layer1")$data
+dot_data = lapply(names(markers), function(ct) {
+    dp = DotPlot(sci_sub, features = markers[[ct]], group.by = "layer1")$data
+    dp$marker_group = ct
+    dp
+})
+dot_df = do.call(rbind, dot_data)
+dot_df$marker_group = factor(dot_df$marker_group, levels = names(markers))
+dot_df = dot_df %>%
+    group_by(marker_group) %>%
+    mutate(pct_scaled = (pct.exp - min(pct.exp)) / (max(pct.exp) - min(pct.exp))) %>%
+    ungroup()
 
-
-# Plot using ggplot with facet_grid(~ marker_group, scales = "free_x", space = "free_x")
+ggplot(dot_df, aes(x = features.plot, y = id, size = pct_scaled, colour = avg.exp.scaled)) +
+    geom_point() +
+    scale_colour_gradient2(low = "steelblue", mid = "white", high = "tomato", name = "Scaled\nexpr") +
+    scale_size_continuous(range = c(0, 6), name = "% cells\n(scaled per group)") +
+    facet_grid(~ marker_group, scales = "free_x", space = "free_x") +
+    theme_minimal() +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        strip.text = element_text(face = "bold", size = 9),
+        panel.spacing = unit(0.3, "lines"),
+        panel.border = element_rect(colour = "grey80", fill = NA)
+    ) +
+    labs(x = NULL, y = "Cluster (layer1)")
 
 ```
 
