@@ -1,0 +1,402 @@
+---
+title: "Notebook 0 — R Warm-up & the Seurat Object"
+subtitle: "CAJAL Neuromics 2026 · Spinal Cord Injury"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+---
+
+This notebook is a hands-on tour, not an exercise — every chunk is filled in and runnable. Work through it top to bottom before Notebook 1. By the end you should be comfortable with basic R syntax and with pulling anything you need — counts, metadata, individual genes — out of a Seurat object.
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+
+PROJ_DIR <- "/shared/projects/tp_2630_ubordeaux_neuromics_184418/projects/C14/"   # set this to your project path, e.g. "/shared/projects/.../projects/C10"
+DATA_DIR <- file.path(PROJ_DIR, "data")
+FIG_DIR  <- file.path(PROJ_DIR, "figures")
+GIT_DIR  <- "~/cajal-project-alan"   # set this to your git checkout path, e.g. "~/cajal-project-alan"
+source(file.path(GIT_DIR, "setup-quarto-visualization.R"))
+```
+
+---
+
+## 1. R warm-up
+
+If you already know R, skim this section and move on — it exists so nobody is blocked by syntax in Notebook 1.
+
+### 1a. Vectors and indexing
+
+R's basic unit is the vector — there is no such thing as a scalar, `5` is just a vector of length 1.
+
+```{r}
+#| label: vectors
+gene_lengths = c(Gfap = 2996, Mbp = 1041, Rbfox3 = 1476, Cx3cr1 = 1653)
+gene_lengths
+
+gene_lengths["Mbp"]          # index by name
+gene_lengths[c(1, 3)]        # index by position
+gene_lengths[gene_lengths > 1500]   # index by logical condition
+names(gene_lengths)
+mean(gene_lengths)
+sort(gene_lengths, decreasing = TRUE)
+```
+
+### 1b. Data frames
+
+A data frame is a table: columns can be different types, every column has the same length. This is exactly what Seurat uses for per-cell metadata.
+
+```{r}
+#| label: dataframes
+toy = data.frame(
+    gene = c("Gfap", "Mbp", "Rbfox3", "Cx3cr1"),
+    cell_type = c("Astrocyte", "Oligodendrocyte", "Neuron", "Microglia"),
+    mean_expr = c(3.2, 5.1, 1.8, 2.4)
+)
+toy
+str(toy)          # structure: types + first values of each column
+toy$mean_expr     # $ pulls out a single column as a vector
+toy[toy$mean_expr > 2, ]          # row filter, base R
+toy[, c("gene", "cell_type")]     # column selection, base R
+```
+
+The same two operations with `dplyr`, which you'll see throughout the course notebooks:
+
+```{r}
+#| label: dplyr-basics
+toy %>% filter(mean_expr > 2)
+toy %>% select(gene, cell_type)
+toy %>% arrange(desc(mean_expr))
+toy %>% group_by(cell_type) %>% summarise(mean_expr = mean(mean_expr), .groups = "drop")
+```
+
+`%>%` (or the base-R `|>`) is the pipe: `x %>% f()` is just `f(x)`. Read it as "take `x`, then do `f`".
+
+### 1c. Functions
+
+```{r}
+#| label: functions
+log2fc = function(mean_a, mean_b) {
+    log2(mean_a / mean_b)
+}
+log2fc(8, 2)
+
+# apply a function across a vector without a loop
+sapply(gene_lengths, function(x) x / 1000)
+```
+
+### 1d. Common gotchas
+
+```{r}
+#| label: gotchas
+# `=` and `<-` are (almost always) interchangeable for assignment
+x = 1
+y <- 2
+
+# indexing starts at 1, not 0
+letters[1]
+
+# NA propagates — check for it explicitly
+v = c(1, 2, NA, 4)
+mean(v)                  # NA
+mean(v, na.rm = TRUE)    # 2.333...
+is.na(v)
+
+# `==` compares, `<-`/`=` assigns — a classic typo source
+1 == 1
+```
+
+> **Try it yourself:** Using `toy` above, write one pipe that keeps only genes with `mean_expr > 2`, sorts them descending by `mean_expr`, and selects just `gene` and `mean_expr`.
+
+---
+
+## 2. What is a Seurat object?
+
+A `Seurat` object bundles everything about a single-cell experiment into one structure:
+
+- **assays** — one or more expression matrices (e.g. `RNA`); each assay can hold multiple **layers** (`counts`, `data` = normalised, `scale.data` = scaled)
+- **meta.data** — a data frame with one row per cell (QC metrics, condition, cluster labels, ...)
+- **reductions** — dimensionality reductions (`pca`, `harmony`, `umap`), once computed
+- **active.ident** — the "current" grouping used by default in many plotting functions
+
+Genes are **rows** (features), cells are **columns** (samples) — the opposite convention from a typical data frame.
+
+```{r}
+#| label: load-object
+sci = readRDS(file.path(DATA_DIR, "sci-subset-atlas-no-annotation.rds"))
+class(sci)
+sci
+```
+
+The print method above is the fastest way to sanity-check an object: assay name, number of features/samples, which layers exist. `slotNames()` shows every slot in the S4 structure if you want to go deeper:
+
+```{r}
+#| label: slots
+slotNames(sci)
+```
+
+---
+
+## 3. Object dimensions and identity
+
+```{r}
+#| label: dims
+dim(sci)                # features x cells
+nrow(sci)                # number of genes
+ncol(sci)                # number of cells
+
+# genes and cell barcodes
+head(rownames(sci))      # == Features(sci)
+head(colnames(sci))      # == Cells(sci)
+```
+
+`Idents(sci)` is the object's default grouping variable — often the cluster or condition used implicitly by plotting functions:
+
+```{r}
+#| label: idents
+levels(Idents(sci))
+table(Idents(sci))
+```
+
+---
+
+## 4. The count matrix
+
+`GetAssayData()` pulls out a layer as a matrix. Raw UMI counts live in the `"counts"` layer.
+
+```{r}
+#| label: get-counts
+counts = GetAssayData(sci, layer = "counts")
+class(counts)     # a sparse matrix (dgCMatrix), not a base R matrix
+dim(counts)
+counts[1:5, 1:4]  # rows = genes, columns = cells
+```
+
+Single-cell count matrices are >90% zeros, so Seurat stores them sparsely — only non-zero values are kept in memory. Converting to a dense `matrix` for the full object would blow up your RAM; only densify small subsets.
+
+```{r}
+#| label: sparsity
+n_zero = sum(counts == 0)
+1 - n_zero / length(counts)   # fraction of entries that are zero
+```
+
+Row/column sums give you the two most basic per-gene and per-cell summaries:
+
+```{r}
+#| label: sums
+lib_size = colSums(counts)      # total UMI per cell ("library size")
+gene_total = rowSums(counts)    # total UMI per gene, across all cells
+
+head(sort(lib_size, decreasing = TRUE))
+head(sort(gene_total, decreasing = TRUE))
+```
+
+---
+
+## 5. Metadata
+
+Per-cell metadata lives in `sci@meta.data` (equivalently `sci[[]]`), one row per cell, aligned to `colnames(sci)`.
+
+```{r}
+#| label: metadata-basics
+head(sci@meta.data)
+colnames(sci@meta.data)
+str(sci@meta.data)
+```
+
+Individual columns can be pulled with `$` or `[[ ]]`, same as any data frame:
+
+```{r}
+#| label: metadata-columns
+head(sci$label)              # condition: uninjured / young / old
+head(sci$replicate)          # biological replicate (animal)
+head(sci$nCount_RNA)         # total UMI per cell (Seurat computes this automatically)
+head(sci$nFeature_RNA)       # number of genes detected per cell
+
+table(sci$label)
+table(sci$replicate)
+```
+
+You can summarise metadata with the same `dplyr` verbs as any table:
+
+```{r}
+#| label: metadata-summarise
+sci@meta.data %>%
+    group_by(label) %>%
+    summarise(
+        n_cells = n(),
+        mean_umi = mean(nCount_RNA),
+        mean_genes = mean(nFeature_RNA),
+        .groups = "drop"
+    )
+```
+
+New metadata columns are added the same way — `PercentageFeatureSet()` is a built-in helper for one common one, percentage of mitochondrial reads (mouse mito genes are prefixed `mt-`, e.g. `mt-Nd1`, `mt-Co1`):
+
+```{r}
+#| label: add-metadata
+sci[["pct_mt"]] = PercentageFeatureSet(sci, pattern = "^mt-")
+head(sci$pct_mt)
+
+# equivalently, from the raw counts directly:
+mito_genes = grep("^mt-", rownames(sci), value = TRUE)
+head(mito_genes)
+```
+
+---
+
+## 6. Looking at specific genes
+
+First, check a gene is actually in the object — a typo or wrong species case (`GFAP` vs `Gfap`) is the most common silent failure here:
+
+```{r}
+#| label: gene-exists
+"Gfap" %in% rownames(sci)
+"GFAP" %in% rownames(sci)   # wrong case — this data is mouse, so gene symbols are Title Case
+```
+
+Pull one gene's raw counts by row-indexing the matrix — this returns a plain named vector, one value per cell:
+
+```{r}
+#| label: one-gene-counts
+gfap_counts = counts["Gfap", ]
+head(gfap_counts)
+summary(gfap_counts)
+mean(gfap_counts > 0)   # fraction of cells with any detected expression
+```
+
+`FetchData()` is usually more convenient: it returns a tidy data frame combining any mix of genes, metadata columns, and reduction coordinates by name.
+
+```{r}
+#| label: fetchdata
+gene_df = FetchData(sci, vars = c("Gfap", "Mbp", "Rbfox3", "label"))
+head(gene_df)
+
+gene_df %>%
+    group_by(label) %>%
+    summarise(mean_Gfap = mean(Gfap), .groups = "drop")
+```
+
+`VlnPlot()` is the quickest way to visualise one or more genes across a grouping variable:
+
+```{r}
+#| label: vlnplot
+VlnPlot(sci, features = c("Gfap", "Mbp", "Rbfox3"), group.by = "label", pt.size = 0)
+```
+
+---
+
+## 7. Plotting with ggplot2
+
+`VlnPlot()`, `DimPlot()`, etc. are convenience wrappers that build a `ggplot` object for you. For anything custom — a specific comparison, a non-standard layout — pull the numbers out into a plain data frame (with `FetchData()`, `colSums()`, or `@meta.data`) and plot it yourself. This is the pattern used throughout the course notebooks.
+
+### 7a. Histogram from a vector
+
+```{r}
+#| label: ggplot-histogram
+lib_df = data.frame(lib_size = lib_size)
+
+ggplot(lib_df, aes(x = lib_size)) +
+    geom_histogram(bins = 50, fill = "steelblue", colour = "white", alpha = 0.7) +
+    scale_x_log10() +
+    labs(title = "Library size per cell", x = "Total UMI (log scale)", y = "Number of cells") +
+    theme_minimal()
+```
+
+### 7b. Boxplot / violin grouped by metadata
+
+`sci` hasn't been normalised yet at this point (only the `counts` layer exists — see Section 2), so `gene_df$Gfap` is a raw UMI count; that's why we plot `Gfap + 1` on a log scale rather than a linear axis.
+
+```{r}
+#| label: ggplot-boxplot
+gene_df %>%
+    ggplot(aes(x = label, y = Gfap + 1, fill = label)) +
+    geom_violin(alpha = 0.5) +
+    geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white") +
+    scale_y_log10() +
+    scale_fill_manual(values = c("steelblue", "tomato", "seagreen")) +
+    labs(title = "Gfap raw counts by condition", x = "Condition", y = "Count + 1 (log scale)") +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+This is (up to styling) exactly what `VlnPlot(sci, features = "Gfap", group.by = "label")` draws for you — useful to know once you want a layout `VlnPlot()` doesn't support directly.
+
+### 7c. Scatter plot of two genes
+
+Most cells have zero counts for both genes, so a small amount of jitter keeps the origin from hiding how many points are actually there.
+
+```{r}
+#| label: ggplot-scatter
+ggplot(gene_df, aes(x = Gfap, y = Mbp, colour = label)) +
+    geom_jitter(width = 0.3, height = 0.3, alpha = 0.4, size = 0.8) +
+    scale_colour_manual(values = c("steelblue", "tomato", "seagreen")) +
+    labs(title = "Gfap vs Mbp raw counts", x = "Gfap (count)", y = "Mbp (count)", colour = "Condition") +
+    theme_minimal()
+```
+
+### 7d. Bar plot from a summary table
+
+```{r}
+#| label: ggplot-barplot
+sci@meta.data %>%
+    group_by(label) %>%
+    summarise(n_cells = n(), .groups = "drop") %>%
+    ggplot(aes(x = label, y = n_cells, fill = label)) +
+    geom_col() +
+    scale_fill_manual(values = c("steelblue", "tomato", "seagreen")) +
+    labs(title = "Cells per condition", x = "Condition", y = "Number of cells") +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+> **Try it yourself:** Adapt 7a to facet the library-size histogram by `replicate` (`facet_wrap(~ replicate)`) instead of pooling all cells together.
+
+---
+
+## 8. Subsetting the object
+
+`subset()` filters cells (and optionally genes) while keeping the object's structure intact — metadata, counts, and (once computed) reductions all stay aligned.
+
+```{r}
+#| label: subset-cells
+sci_uninj = subset(sci, subset = label == "uninjured")
+dim(sci_uninj)
+table(sci_uninj$label)
+```
+
+Square-bracket indexing works the same way as a matrix: `[genes, cells]`.
+
+```{r}
+#| label: subset-bracket
+sci_two_genes = sci[c("Gfap", "Mbp"), ]
+dim(sci_two_genes)
+
+sci_first10 = sci[, 1:10]
+dim(sci_first10)
+```
+
+---
+
+## 9. Cheat sheet
+
+| Want | Code |
+|---|---|
+| Dimensions (genes x cells) | `dim(sci)` |
+| Gene names / cell barcodes | `rownames(sci)` / `colnames(sci)` |
+| Raw counts matrix | `GetAssayData(sci, layer = "counts")` |
+| Normalised data (after `NormalizeData()`) | `GetAssayData(sci, layer = "data")` |
+| All metadata | `sci@meta.data` or `sci[[]]` |
+| One metadata column | `sci$label` |
+| One gene, all cells (vector) | `GetAssayData(sci, layer = "counts")["Gfap", ]` |
+| Genes + metadata together (data frame) | `FetchData(sci, vars = c("Gfap", "label"))` |
+| Filter cells by metadata | `subset(sci, subset = label == "uninjured")` |
+| Filter genes/cells by position | `sci[genes, cells]` |
+
+You now have the tools to explore the object however you like. Notebook 1 picks up from here: QC filtering, normalisation, integration, and cell type annotation on this same spinal cord injury dataset.
