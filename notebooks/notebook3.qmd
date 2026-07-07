@@ -15,6 +15,8 @@ format:
 library(Seurat)
 library(ggplot2)
 library(patchwork)
+library(ranger)
+library(pROC)
 library(sparseMatrixStats)
 library(Augur)
 
@@ -27,23 +29,310 @@ source(file.path(GIT_DIR, "setup-quarto-visualization.R"))
 
 ---
 
-## Cell population prioritization
+## 1. Why not just count DE genes? (Demo)
 
 In Notebook 2, you identified differentially expressed genes per cell type. A natural next question: **which cell type is most perturbed by spinal cord injury?**
 
-Counting significant DE genes per cell type is tempting but misleading — it is biased by cell count, effect size, and choice of significance threshold. A more principled question is: *how distinguishable are the two conditions from each other within each cell type?* Train a classifier to predict condition from single-cell expression and evaluate with AUC — high AUC means the cell type's transcriptome is separable by condition, i.e. perturbed. AUC = 0.5 means conditions are indistinguishable. This is the core idea of **Augur**, which repeatedly subsamples a small balanced set of cells and averages classifier AUC across trials so that cell types are compared on equal footing regardless of size.
+The naive answer is to count significant DE genes per cell type and rank. We can show directly with simulations why this fails.
+
+### Problem 1 — cell count bias
+
+Two cell types with **identical biology** (same `de_prob`, same `de_fc`) but 10× different cell counts.
+
+```{r}
+#| label: bias-cellcount
+set.seed(42)
+sim_abundant = simulate_counts(n_genes = 1000, n_cells = 1000, de_prob = 0.2, de_fc = 2, n_samples = 6)
+sim_rare = simulate_counts(n_genes = 1000, n_cells = 100, de_prob = 0.7, de_fc = 2, n_samples = 6)
+
+so_ab = CreateSeuratObject(counts = sim_abundant$counts, meta.data = sim_abundant$metadata)
+so_ab$cell_type = "Simulated"
+so_ra = CreateSeuratObject(counts = sim_rare$counts, meta.data = sim_rare$metadata)
+so_ra$cell_type = "Simulated"
+
+res_ab = Libra::run_de(so_ab, cell_type_col = "cell_type", label_col = "label", replicate_col = "replicate")
+res_ra = Libra::run_de(so_ra, cell_type_col = "cell_type", label_col = "label", replicate_col = "replicate")
+fdr_ab = setNames(res_ab$p_val_adj, res_ab$gene)
+fdr_ra = setNames(res_ra$p_val_adj, res_ra$gene)
+
+data.frame(
+    cell_type = c("Abundant (1000 cells)", "Rare (100 cells)"),
+    true_de_genes = c(length(sim_abundant$de_genes), length(sim_rare$de_genes)),
+    sig_genes_FDR05 = c(sum(fdr_ab < 0.05), sum(fdr_ra < 0.05))
+)
+```
+
+**Interpret:** Why does the rare cell type produce fewer significant hits even though the biology is identical? What does this tell you about using DE gene counts to rank cell types by perturbation?
+
+Augur addresses this by downsampling to a fixed number of cells per fold before training — every cell type is evaluated on equal footing regardless of how many cells it has.
+
+### Problem 2 — effect size is ignored
+
+Two cell types with the same number of cells but different effect sizes: type A has many small-effect DE genes, type B has few large-effect ones.
+
+```{r}
+#| label: bias-effectsize
+sim_many_weak = simulate_counts(n_genes = 1000, n_cells = 1000, de_prob = 0.3, de_fc = 1.5, n_samples = 4)
+sim_few_strong = simulate_counts(n_genes = 1000, n_cells = 1000, de_prob = 0.05, de_fc = 6, n_samples = 4)
+
+so_weak = CreateSeuratObject(counts = sim_many_weak$counts, meta.data = sim_many_weak$metadata)
+so_weak$cell_type = "Simulated"
+so_strong = CreateSeuratObject(counts = sim_few_strong$counts, meta.data = sim_few_strong$metadata)
+so_strong$cell_type = "Simulated"
+
+res_weak = Libra::run_de(so_weak, cell_type_col = "cell_type", label_col = "label", replicate_col = "replicate")
+res_strong = Libra::run_de(so_strong, cell_type_col = "cell_type", label_col = "label", replicate_col = "replicate")
+fdr_weak = setNames(res_weak$p_val_adj, res_weak$gene)
+fdr_strong = setNames(res_strong$p_val_adj, res_strong$gene)
+
+data.frame(
+    cell_type = c("Many weak DE (fc=1.5)", "Few strong DE (fc=6)"),
+    true_de_genes = c(length(sim_many_weak$de_genes), length(sim_few_strong$de_genes)),
+    sig_genes_FDR05 = c(sum(fdr_weak < 0.05), sum(fdr_strong < 0.05))
+)
+```
+
+**Interpret:** Which cell type gets ranked higher by DE count — the one with many weak changes or the one with few strong changes? Does that ranking match what you would expect biologically?
+
+### Problem 3 — threshold sensitivity
+
+Using the results above, how does the ranking change at different thresholds?
+
+```{r}
+#| label: bias-threshold
+thresholds = c(0.001, 0.01, 0.05, 0.1, 0.2)
+thresh_df = do.call(rbind, lapply(thresholds, function(t) {
+    data.frame(
+        threshold = t,
+        abundant = sum(fdr_ab < t),
+        rare = sum(fdr_ra < t),
+        many_weak = sum(fdr_weak < t),
+        few_strong = sum(fdr_strong < t)
+    )
+}))
+thresh_df$top_ranked = apply(thresh_df[, -1], 1, function(x) names(x)[which.max(x)])
+thresh_df
+```
+
+**Interpret:** Does the ranking of cell types stay the same across thresholds? What does this tell you about relying on a fixed significance cutoff to compare perturbation levels?
 
 ---
 
-## 1. Cell population prioritization on the SCI atlas
+A more principled question: *how distinguishable are the two conditions from each other within each cell type?* If injured and uninjured cells look indistinguishable in a given cell type, it is unlikely that cell type plays a major role in the injury response.
+
+A classifier answers this directly. Train a model to predict condition from single-cell gene expression. Evaluate with AUC. High AUC → cells are separable → cell type is perturbed. AUC = 0.5 → random performance → conditions are indistinguishable.
+
+This is the core idea of **Augur**.
+
+---
+
+## 2. Augur from scratch
+
+We simulate four cell types with known ground truth — different perturbation levels — so we can verify that Augur recovers the correct ranking.
+
+```{r}
+#| label: sim-celltypes
+set.seed(42)
+ct_params = list(
+    "TypeA_null" = list(de_prob = 0, de_fc = 0, n_cells = 1000),
+    "TypeB_mild" = list(de_prob = 0.2, de_fc = 1.5, n_cells = 600),
+    "TypeC_moderate" = list(de_prob = 0.3, de_fc = 2, n_cells = 300),
+    "TypeD_strong" = list(de_prob = 0.4, de_fc = 4, n_cells = 300)
+)
+
+sims = lapply(ct_params, function(p) {
+    simulate_counts(n_genes = 500, n_cells = p$n_cells, n_samples = 4, de_prob = p$de_prob, de_fc = p$de_fc, batch_effect = 0)
+})
+
+all_counts = do.call(cbind, lapply(names(sims), function(ct) {
+    m = sims[[ct]]$counts
+    colnames(m) = paste0(ct, "_", colnames(m))
+    m
+}))
+all_meta = do.call(rbind, lapply(names(sims), function(ct) {
+    meta = sims[[ct]]$metadata
+    meta$cell_type = ct
+    rownames(meta) = paste0(ct, "_", rownames(meta))
+    meta
+}))
+
+sim_obj = CreateSeuratObject(counts = all_counts, meta.data = all_meta)
+cat("Cells:", ncol(sim_obj), "  Genes:", nrow(sim_obj), "\n")
+cat("Cell types:", paste(unique(sim_obj$cell_type), collapse = ", "), "\n")
+```
+
+### 2a. Visualising separability
+
+Before building a classifier, we can check whether conditions are separable at all using PCA. Run a separate PCA for each simulated cell type and colour by label.
+
+```{r}
+#| label: pca-separability
+#| message: false
+#| warning: false
+#| eval: false
+# For each cell type subset: NormalizeData -> FindVariableFeatures(nfeatures=200)
+#   -> ScaleData -> RunPCA(npcs=10)
+# Collect PC1/PC2 embeddings across all types to set shared axis limits
+# DimPlot per type coloured by label; wrap_plots(ncol=2)
+
+
+```
+
+**Interpret:** How does the PCA look for TypeA_null compared to TypeD_strong? What does the degree of overlap between condition labels tell you about the perturbation level of each cell type?
+
+### 2b. Single classifier on full data — one estimate, unknown uncertainty
+
+```{r}
+#| label: cv-auc-single
+#| eval: false
+#| message: false
+#| warning: false
+# 3-fold CV per cell type on the FULL expression matrix (not subsampled)
+# NormalizeData, X = t(as.matrix(GetAssayData(...))), y = factor(label)
+# For each fold: ranger(probability=TRUE, num.trees=100) + pROC::auc
+# Plot per-type AUC dots + mean crossbar; note that strong types all saturate at ~1
+
+
+```
+
+With hundreds of cells and all 500 genes, the classifier overfits: TypeB, TypeC and TypeD all achieve AUC = 1.0 even though their true perturbation levels differ substantially. The ranking is lost — a mild signal looks identical to a strong one. TypeA_null is the only type that doesn't saturate, but that tells us nothing about the ordering of the other three.
+
+The fix is to evaluate on a small, balanced subsample so the classifier cannot memorize the training set. With only 50 cells per condition, the signal-to-noise ratio limits the AUC — weaker perturbations achieve lower AUC, restoring the ranking.
+
+### 2d. Repeated subsampling — Augur's approach
+
+Augur runs many independent trials: each trial randomly subsamples a small balanced dataset (20 cells per condition), trains a classifier and computes AUC, then averages across trials. This gives both a stable point estimate and a distribution over estimates.
+
+```{r}
+#| label: cv-auc-augur
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 8
+n_trials = 50
+n_sub = 20
+
+run_trial = function(X, y, seed) {
+    set.seed(seed)
+    g1 = which(y == levels(y)[1])
+    g2 = which(y == levels(y)[2])
+    idx = c(sample(g1, min(n_sub, length(g1))),
+            sample(g2, min(n_sub, length(g2))))
+    Xs = X[idx, ]
+    ys = y[idx]
+    fold_ids = sample(rep(seq_len(3), length.out = length(ys)))
+    mean(sapply(seq_len(3), function(fold) {
+        tr = fold_ids != fold
+        te = fold_ids == fold
+        fit = ranger(x = Xs[tr, ], y = ys[tr], num.trees = 100, probability = TRUE, seed = seed)
+        probs = predict(fit, data = Xs[te, ])$predictions[, levels(ys)[1]]
+        as.numeric(auc(ys[te], probs, levels = levels(ys), direction = ">", quiet = TRUE))
+    }))
+}
+
+# Select high-variance features once per cell type, before running trials
+ct_data = lapply(names(sims), function(ct_name) {
+    obj = sim_obj[, sim_obj$cell_type == ct_name]
+    var_mat = Augur::select_variance(GetAssayData(obj, layer = "counts"), var_quantile = 0.5)
+    list(X = t(as.matrix(var_mat)), y = factor(obj$label))
+})
+names(ct_data) = names(sims)
+
+trial_df = do.call(rbind, lapply(names(sims), function(ct_name) {
+    X = ct_data[[ct_name]]$X
+    y = ct_data[[ct_name]]$y
+    aucs = sapply(seq_len(n_trials), function(s) run_trial(X, y, seed = s))
+    data.frame(cell_type = ct_name, trial = seq_len(n_trials), auc = aucs)
+}))
+
+single_means = aggregate(auc ~ cell_type, data = cv_single_df, FUN = mean)
+trial_means = aggregate(auc ~ cell_type, trial_df, mean)
+
+ggplot(trial_df, aes(x = auc, fill = cell_type)) +
+    geom_histogram(binwidth = 0.02, colour = "white", alpha = 0.8) +
+    geom_vline(data = trial_means, aes(xintercept = auc), linetype = "dashed") +
+    geom_text(data = trial_means, aes(x = auc, label = round(auc, 3)),y = Inf, vjust = 1.5, hjust = -0.1, size = 3, inherit.aes = FALSE) +
+    geom_vline(data = single_means, aes(xintercept = auc),
+    linetype = "dotted", colour = "tomato") +
+    facet_wrap(~ cell_type, ncol = 2) +
+    geom_hline(yintercept = 0) +
+    labs(x = "AUC per trial", y = "Count",
+         title = paste0(n_trials, " trials × ", n_sub, " cells per condition"),
+         subtitle = "Dashed = trial mean  ·  Dotted red = single 3-fold CV mean") +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+**Interpret:** Does the trial mean (dashed) match the single CV mean (red dotted) for each cell type? How does the width of the distribution differ between TypeA_null and TypeD_strong?
+
+---
+
+## 3. Run Augur across all simulated cell types
+
+```{r}
+#| label: run-augur
+#| eval: false
+augur_res = Augur::calculate_auc(
+    sim_obj,
+    label_col = "label",
+    cell_type_col = "cell_type",
+    n_threads = 4
+)
+
+plot_lollipop(augur_res) +
+    labs(title = "Augur AUC — simulated cell types", subtitle = "Ground truth perturbation: TypeD (40% DE, fc=4) > TypeC (30%, fc=2) > TypeB (10%, fc=1.5) > TypeA (null)")
+```
+
+---
+
+## 4. Validate: AUC vs ground truth
+
+```{r}
+#| label: validate
+#| eval: false
+# augur_res$AUC contains cell_type and auc columns
+# Add de_prob, de_fc, and perturbation = de_prob * log2(de_fc) from ct_params
+# Add manual_auc from trial_means computed in the previous chunk
+# Print ordered by descending AUC
+
+
+```
+
+```{r}
+#| label: validate-plot
+#| eval: false
+# Order cell types by ground truth perturbation rank
+# geom_point coloured by cell type, geom_text label with AUC
+# geom_hline at 0.5 (chance level)
+
+
+```
+
+**Interpret:** Does Augur recover the correct ranking? What AUC does TypeA_null achieve, and what does that tell you about the test's calibration?
+
+**Explore:** TypeD_strong has the most DE genes in the simulation AND the highest AUC. But what if you found a cell type in the real data with very high AUC but few significant DE genes? What biological explanation would you propose?
+
+---
+
+::: {.callout-warning}
+## CHECKPOINT
+
+When does prioritization tell you something DE cannot?
+
+- In the simulation, does the Augur AUC ranking match the ground truth de_prob order? What does TypeA_null's AUC tell you about the method's calibration?
+- From section 1: TypeD_strong has 350 true DE genes but only 9 are detected by pseudobulk. Would Augur still rank it highly? Why or why not?
+- Can you think of a real biological scenario where a cell type has many DE genes but low Augur AUC? Or few DE genes but high AUC?
+:::
+
+---
+
+## 7. Cell population prioritization on the SCI atlas
 
 ```{r}
 #| label: load-sci
-#| eval: false
-# Load the real sci-subset-atlas-annotated.rds and print cell/condition counts
-# Hint: sci = readRDS(file.path(DATA_DIR, "sci-subset-atlas-annotated.rds")); table(sci$label)
-
-
+sci = readRDS(file.path(DATA_DIR, "sci-subset-atlas-annotated.rds"))
+cat("Cells:", ncol(sci), "\n")
+table(sci$label)
 ```
 
 Run Augur at three annotation resolutions across all pairwise condition comparisons.
@@ -51,6 +340,8 @@ Run Augur at three annotation resolutions across all pairwise condition comparis
 ```{r}
 #| label: augur-sci
 #| eval: false
+#| message: false
+#| warning: false
 # Nested loop: comparisons (young vs uninjured, old vs uninjured, young vs old)
 #   × layers (layer1, layer2, layer3)
 # Subset sci to the two conditions, then call:
@@ -63,6 +354,7 @@ Run Augur at three annotation resolutions across all pairwise condition comparis
 ```{r}
 #| label: augur-sci-plot
 #| eval: false
+#| fig-height: 12
 # lapply over sci_results: plot_lollipop(res) + labs(title=key)
 # wrap_plots(plots, ncol=3)
 
@@ -75,11 +367,37 @@ Run Augur at three annotation resolutions across all pairwise condition comparis
 
 ---
 
-::: {.callout-warning}
-## CHECKPOINT
+## Challenge: Apply to your own data
 
-When does prioritization tell you something DE cannot?
+Find a publicly available scRNA-seq dataset with **at least two conditions** and **cell type annotations**, and apply the Augur cell type prioritisation pipeline from this notebook. Unlike pseudobulk DE, Augur does not require biological replicates, so a broader range of datasets will work.
 
-- Do the same cell types rank highly across all three comparisons? Does layer resolution change the picture?
-- Can you think of a real biological scenario where a cell type has many DE genes but low Augur AUC? Or few DE genes but high AUC?
-:::
+### Where to find data
+
+- **GEO**, **CELLxGENE** (`cellxgene.cziscience.com`), or **Zenodo** — same sources as notebook 2
+- Any dataset with a `label` (two conditions) and `cell_type` annotation column is sufficient
+
+### Tasks
+
+1. Load the dataset and subset to two conditions of interest.
+2. Run `Augur::calculate_auc()` and plot the AUC lollipop chart.
+3. Which cell types rank highest? Is the ranking what you expected?
+4. If two annotation levels are available (coarse vs fine), run Augur on both. Does ranking change between coarse and fine resolution?
+5. Look up 1–2 of the top-ranked cell types in the literature — is there evidence that these cells respond preferentially to your perturbation?
+
+```{r}
+#| label: byod-nb3
+#| eval: false
+# Load your dataset
+# obj = readRDS(file.path(PROJ_DIR, "your-dataset.rds"))
+
+# Confirm required metadata
+# table(obj$label)       # two conditions
+# table(obj$cell_type)   # cell type annotation
+
+# Subset to two conditions and run Augur
+# sub = obj[, obj$label %in% c("cond1", "cond2")]
+# res = Augur::calculate_auc(sub, label_col = "label", cell_type_col = "cell_type", n_threads = 4)
+# plot_lollipop(res)
+```
+
+**What did you find?** Write 3–4 sentences describing which cell types are most perturbed and whether this matches known biology for your system.
