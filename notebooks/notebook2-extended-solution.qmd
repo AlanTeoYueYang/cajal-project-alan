@@ -21,6 +21,8 @@ library(clusterProfiler)
 library(org.Mm.eg.db)
 library(splatter)
 library(sparseMatrixStats)
+library(lme4)
+library(lmerTest)
 
 PROJ_DIR <- "/shared/projects/tp_2630_ubordeaux_neuromics_184418/projects/C14/"
 DATA_DIR <- file.path(PROJ_DIR, "data")
@@ -592,12 +594,93 @@ Many top GO terms in microglia after SCI involve complement activation, phagocyt
 
 ---
 
+## 10. Custom gene sets — module scores
+
+GO and GSEA test pre-defined databases of gene sets. Often you instead have a **custom gene panel** from a specific paper — a signature that isn't in GO/MSigDB at all. Seurat's `AddModuleScore` lets you score every cell for such a panel directly: for each cell, it computes the average expression of the panel genes minus the average expression of a control gene set (randomly sampled, matched for expression level), giving one number per cell instead of a per-gene test.
+
+As an example, we use the **blood–brain barrier (BBB) dysfunction module** from Munji et al. (2019, *Nat Neurosci*) — a set of genes consistently induced in vascular endothelial cells across seven different CNS injury/disease models when the BBB breaks down.
+
+```{r}
+#| label: bbb-module-genes
+bbb_genes = c(
+    "Acot7", "Adam12", "Adam19", "Adamts4", "Adamts8", "Aebp1", "Aldh18a1", "Aldh1a2", "Anln", "Anxa1",
+    "Apln", "Aplnr", "Aprt", "Aspm", "Atp8b1", "B3gnt3", "Bicc1", "Bmp1", "Bub1b", "Cip2a",
+    "Casp4", "Ccl2", "Ccna2", "Ccnb2", "Cd14", "Cd44", "Cdk1", "Cenpe", "Cenpf", "Ch25h",
+    "Chst1", "Ckap2", "Cks1b", "Cmtm3", "Col12a1", "Col1a1", "Col1a2", "Col3a1", "Col5a1", "Col5a2",
+    "Cxcl10", "Cyp1b1", "D17H6S56E-5", "Ackr1", "Dcn", "Dkk3", "Dpysl3", "Emilin1", "Fblim1", "Fbln1",
+    "Fbn1", "Fkbp10", "Flnc", "Frrs1", "Fscn1", "Gjb2", "Gm6169", "Hmmr", "Ifitm1", "Igfbp4",
+    "Igfbp5", "Igsf10", "Islr", "Itgb3", "Kif11", "Kif15", "Kif20b", "Kit", "Lamb1", "Lbp",
+    "Lcp2", "Lgals1", "Lgmn", "Lox", "Loxl2", "Loxl3", "Lrg1", "Lum", "Marcksl1", "Mcm5",
+    "Meox1", "Mki67", "Mmp14", "Myc", "Ndc80", "Nfil3", "Nt5dc2", "Parp3", "Pdlim1", "Pgf",
+    "Plekho1", "Plekho2", "Postn", "Prc1", "Ptgfrn", "Ptgs2", "Nectin2", "Pxdn", "Robo1", "Rrm2",
+    "Runx1", "S100a6", "Scgb3a1", "Sele", "Selp", "Serpine1", "Serping1", "Slc16a6", "Slc43a3", "Slc7a11",
+    "Slc7a7", "Slfn9", "Spp1", "Sulf1", "Sulf2", "Synpo", "Tacc3", "Thbs1", "Thbs2", "Thy1",
+    "Timp1", "Tlr2", "Sting1", "Tmem176a", "Tnc", "Tnfrsf23", "Tnfsf8", "Top2a", "Tpx2", "Trp53i11",
+    "Tubb6", "Ube2c", "Upp1", "Vcan", "Vwf", "Zfp521"
+)
+
+vec = sci_sub[, sci_sub$cell_type == "Vascular endothelial cells"]
+vec = NormalizeData(vec, verbose = FALSE)
+
+bbb_present = intersect(bbb_genes, rownames(vec))
+cat(length(bbb_present), "/", length(bbb_genes), "BBB dysfunction genes found in the dataset\n")
+
+vec = AddModuleScore(vec, features = list(bbb_present), name = "BBB_dysfunction")
+vec_meta = vec@meta.data
+vec_meta$label = factor(vec_meta$label, levels = c("uninjured", "young", "old"))
+```
+
+```{r}
+#| label: bbb-module-boxplot
+#| fig-width: 6
+#| fig-height: 5
+ggplot(vec_meta, aes(x = label, y = BBB_dysfunction1, fill = label)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_jitter(width = 0.15, size = 0.4, alpha = 0.3) +
+    scale_fill_brewer(palette = "Set2") +
+    labs(
+        title = "BBB dysfunction module score — vascular endothelial cells",
+        x = NULL, y = "Module score (AddModuleScore)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+**Interpret:** Does the BBB dysfunction score look higher in injured (young/old) vs uninjured spinal cord? Is the spread within a condition mostly driven by a few animals, or evenly spread across cells?
+
+Just like in sections 2–6, cells from the same animal are not independent observations — a t-test or Wilcoxon test on cell-level module scores would treat every cell as a fresh data point and produce an overconfident p-value. The fix is the same: a **mixed model** with replicate as a random effect, so the test statistic reflects between-animal variation rather than between-cell variation.
+
+```{r}
+#| label: bbb-module-lmm
+bbb_lmm_res = do.call(rbind, lapply(names(comparisons), function(comp) {
+    conds = comparisons[[comp]]
+    df = vec_meta[vec_meta$label %in% conds, ]
+    df$label = factor(df$label, levels = conds)
+    fit = lmerTest::lmer(BBB_dysfunction1 ~ label + (1 | replicate), data = df)
+    coefs = summary(fit)$coefficients
+    data.frame(
+        comparison = comp,
+        estimate   = coefs[2, "Estimate"],
+        std_error  = coefs[2, "Std. Error"],
+        p_value    = coefs[2, "Pr(>|t|)"]
+    )
+}))
+bbb_lmm_res
+```
+
+**Explore:** Which comparison(s) show a significant difference in BBB dysfunction score? Does the direction (higher after injury?) match what you'd expect biologically? Would you have reached the same conclusion with a naive t-test on all cells pooled together?
+
+The BBB dysfunction module is typically elevated in the young-injured condition relative to uninjured, consistent with acute vascular breakdown after SCI. Whether the old-injured group differs from young-injured depends on how aging affects the vascular response — comparing the effect size (not just significance) across the three rows of `bbb_lmm_res` is the more informative read than the p-value alone, since the mixed model down-weights the (large) cell-level sample size to the (small) number of animals.
+
+---
+
 ::: {.callout-warning}
 ## CHECKPOINT
 Which cell type has the most DE genes? Are the responses cell-type-specific or shared?
 
 - How different are the Wilcoxon hits (section 1) from the pseudobulk hits (section 7)?
 - What do GO and GSEA together suggest about what is happening in your chosen cell type after injury?
+- Does the BBB dysfunction module score differ across the three comparisons, and does a mixed model change your conclusion relative to a naive cell-level test?
 :::
 
 ---

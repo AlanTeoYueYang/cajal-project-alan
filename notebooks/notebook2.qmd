@@ -20,6 +20,8 @@ library(patchwork)
 library(clusterProfiler)
 library(org.Mm.eg.db)
 library(sparseMatrixStats)
+library(lme4)
+library(lmerTest)
 
 PROJ_DIR <- "/shared/projects/tp_2630_ubordeaux_neuromics_184418/projects/C14/"   # set this to your project path, e.g. "/shared/projects/.../projects/C10"
 DATA_DIR <- file.path(PROJ_DIR, "data")
@@ -140,9 +142,58 @@ GO ORA only uses genes that pass a threshold. GSEA uses the **full ranked list**
 
 ---
 
+## 4. Custom gene sets — module scores
+
+GO and GSEA test pre-defined databases of gene sets. Often you instead have a **custom gene panel** from a specific paper — a signature that isn't in GO/MSigDB at all. Seurat's `AddModuleScore` lets you score every cell for such a panel directly: for each cell, it computes the average expression of the panel genes minus the average expression of a control gene set (randomly sampled, matched for expression level), giving one number per cell instead of a per-gene test.
+
+As an example, we use the **blood–brain barrier (BBB) dysfunction module** from Munji et al. (2019, *Nat Neurosci*) — a set of genes consistently induced in vascular endothelial cells across seven different CNS injury/disease models when the BBB breaks down.
+
+```{r}
+#| label: bbb-module-genes
+#| eval: false
+# Define the BBB dysfunction gene panel (Munji et al. 2019) as a character vector: bbb_genes
+# Subset sci_sub to cell_type == "Vascular endothelial cells" -> vec
+# NormalizeData(vec)
+# Check how many bbb_genes are actually present in rownames(vec) (intersect)
+# Run AddModuleScore(vec, features = list(<genes present>), name = "BBB_dysfunction")
+# Pull vec@meta.data into vec_meta
+
+
+```
+
+```{r}
+#| label: bbb-module-boxplot
+#| eval: false
+# Boxplot of BBB_dysfunction1 by label (condition), one box per condition, fill by label
+# geom_boxplot(outlier.shape=NA) + geom_jitter(small size/alpha) for the individual cells
+
+
+```
+
+**Interpret:** Does the BBB dysfunction score look higher in injured (young/old) vs uninjured spinal cord? Is the spread within a condition mostly driven by a few animals, or evenly spread across cells?
+
+Just like in section 1, cells from the same animal are not independent observations — a t-test or Wilcoxon test on cell-level module scores would treat every cell as a fresh data point and produce an overconfident p-value. The fix is the same: a **mixed model** with replicate as a random effect, so the test statistic reflects between-animal variation rather than between-cell variation.
+
+```{r}
+#| label: bbb-module-lmm
+#| eval: false
+# For each of the three comparisons (reuse the `comparisons` list from section 1):
+#   subset vec_meta to those two conditions
+#   fit lmerTest::lmer(BBB_dysfunction1 ~ label + (1 | replicate), data = <subset>)
+#   pull the label coefficient's estimate and p-value from summary(fit)$coefficients
+# Collect results (comparison, estimate, p_value) into one data frame and print it
+
+
+```
+
+**Explore:** Which comparison(s) show a significant difference in BBB dysfunction score? Does the direction (higher after injury?) match what you'd expect biologically? Would you have reached the same conclusion with a naive t-test on all cells pooled together?
+
+---
+
 ::: {.callout-warning}
 ## CHECKPOINT
 Which cell type has the most DE genes? Are the responses cell-type-specific or shared?
 
 - What do GO and GSEA together suggest about what is happening in your chosen cell type after injury?
+- Does the BBB dysfunction module score differ across the three comparisons, and does a mixed model change your conclusion relative to a naive cell-level test?
 :::
