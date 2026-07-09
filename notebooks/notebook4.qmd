@@ -1,5 +1,5 @@
 ---
-title: "Notebook 4 (Extended) — Spatial Transcriptomics & Vespucci"
+title: "Notebook 4 — Spatial Transcriptomics & Vespucci"
 subtitle: "CAJAL Neuromics 2026 · Spinal Cord Injury"
 format:
   html:
@@ -187,6 +187,43 @@ Each Visium spot is ~55 µm in diameter and captures RNA from 1–10 cells. The 
 
 **RCTD** (Robust Cell Type Decomposition, Cable et al. 2022) solves this by fitting a Poisson model to each spot's counts using our annotated scRNA-seq atlas as a reference. The `spacexr` package is not installed in the course environment so RCTD was run offline; we load the pre-computed proportions here.
 
+### How RCTD was run
+
+RCTD needs two ingredients: a **puck** (the spatial data — counts, spot coordinates, per-spot UMI) and a **reference** (the annotated snRNA-seq atlas — counts, per-cell type label, per-cell UMI). `create.RCTD()` fits the model; `run.RCTD(..., doublet_mode = "full")` returns a full weight vector per spot rather than just the top 1–2 cell types, which suits Visium spots that mix several cells.
+
+```{r}
+#| label: rctd-run
+#| eval: false
+# library(spacexr)
+
+# Build the spatial puck for one condition from sci-spatial.rds:
+#   sp = readRDS(...); subset sp to meta.data$label == <condition>
+#   coords = meta.data[, c("x","y")]
+#   sp_counts = GetAssayData(sp, layer="counts"); nUMI = colSums(sp_counts)
+#   puck = SpatialRNA(coords, sp_counts, nUMI)
+
+# Build the snRNA-seq reference from sci-subset-atlas-annotated.rds:
+#   sc = readRDS(...)
+#   meta = sc@meta.data with a cell-type column (layer1/layer2/layer3),
+#     drop cell types with <=25 cells (RCTD needs >25 per reference type)
+#   sc_counts = GetAssayData(sc, layer="counts")[, meta$barcode]
+#   cell_type = named factor of cell-type labels, one per barcode (names = barcode)
+#   nUMI = colSums(sc_counts)
+#   reference = Reference(sc_counts, cell_type, nUMI)
+
+# myRCTD = create.RCTD(puck, reference, max_cores=10,
+#     gene_cutoff=..., gene_cutoff_reg=..., fc_cutoff=..., fc_cutoff_reg=...,
+#     UMI_min=..., UMI_max=...)
+# myRCTD = run.RCTD(myRCTD, doublet_mode="full")
+
+# Reshape myRCTD@results$weights (normalize_weights()) into long format:
+#   barcode x cell_type x weight x resolution
+# Repeat for every label x {layer1, layer2, layer3} combination, bind_rows(),
+# and saveRDS() to build sci-spatial-rctd.rds.
+
+
+```
+
 ```{r}
 #| label: rctd-load
 #| eval: false
@@ -296,27 +333,79 @@ cat("DE genes:", sum(spatial_sim_genes$truth), "  Non-DE:", sum(spatial_sim_gene
 
 ```{r}
 #| label: sim-setup
-#| eval: false
-# p_label: geom_point(shape=21, aes(fill=label)) coloured by label_pal
-#   aes(x=y, y=x) — note the axis swap to match reference orientation
-# p_circle: map label_sim (background/perturbed) to integer, gradient fill grey90->#2166AC
-# p_label | p_circle
+#| fig-width: 7
+#| fig-height: 4
+label_pal = c(Perturbation_1 = '#F4F27E', Perturbation_2 = '#372367')
 
+p_label = ggplot(meta_sim, aes(x = y, y = x, fill = label)) +
+    geom_point(shape = 21, stroke = NA, size = 0.3) +
+    scale_fill_manual(values = label_pal, name = 'Condition') +
+    guides(fill = guide_legend(override.aes = list(size = 1.5))) +
+    coord_fixed() + theme_bw() +
+    theme(panel.grid = element_blank(), axis.title = element_blank(),
+          axis.text = element_blank(), axis.ticks = element_blank(),
+          legend.position = 'top')
 
+p_circle = meta_sim %>%
+    mutate(label_sim = factor(label_sim, levels = c('background', 'perturbed')),
+           label_sim = as.integer(label_sim)) %>%
+    ggplot(aes(x = y, y = x, fill = label_sim, color = label_sim)) +
+    ggtitle('Ground truth: perturbed region') +
+    geom_point(size = 0.5, shape = 21, stroke = 0) +
+    scale_fill_gradientn(colours = c('grey90', '#2166AC'), name = 'Perturbation',breaks = c(1, 2), labels = c('background', 'perturbed')) +
+    scale_color_gradientn(colours = c('grey90', '#2166AC'), name = 'Perturbation',breaks = c(1, 2), labels = c('background', 'perturbed')) +
+    guides(fill = guide_colorbar(frame.colour = 'black', ticks = FALSE), color = guide_colorbar(frame.colour = 'black', ticks = FALSE)) +
+    coord_fixed() + theme_bw() +
+    theme(panel.grid = element_blank(), axis.title = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(), legend.position = 'top')
+
+p_label | p_circle
 ```
 
 Now plot the spatial expression of top 3 DE genes (`truth = 1`) by delta mean. We fit a LOESS surface within each condition and predict onto a regular grid — this reveals the circle pattern that is invisible in raw scattered points.
 
 ```{r}
 #| label: sim-genes
-#| eval: false
-# Select genes_to_show: top 3 by biggest |delta| and top 3 by smallest (using spatial_sim_genes$delta)
-# For each gene: LOESS fit within each label using loess(expr ~ x * y, span=0.02, degree=1)
-# Predict onto a regular grid via tidyr::crossing(x=x_seq, y=y_seq) + predict(fit, newdata=.)
-# geom_raster() with YlOrRd palette, facet_wrap(~ label)
-# Hint: use drop_na(interp) after predict to remove grid points outside the tissue
+#| fig-width: 10
+#| fig-height: 12
+# SCTransform already applied — select genes by fold change magnitude
+spatial_sim_genes$delta = abs(spatial_sim_genes$GeneMean - spatial_sim_genes$BaseGeneMean)
+genes_to_show = head(spatial_sim_genes$gene[order(-spatial_sim_genes$delta)], 3)
 
+dat_sim = meta_sim[, c('x', 'y', 'label')]
+expr_mat = as.matrix(GetAssayData(spatial_sim, assay = "SCT", layer = 'data')[genes_to_show, ])
 
+x_seq = seq(floor(min(dat_sim$x)), ceiling(max(dat_sim$x)), length.out = 80)
+y_seq = seq(floor(min(dat_sim$y)), ceiling(max(dat_sim$y)), length.out = 80)
+
+plot_list_sim = list()
+for (gene in genes_to_show) {
+    dat_sim$expr = expr_mat[gene, rownames(dat_sim)]
+    plot_df = map_dfr(unique(dat_sim$label), ~ {
+        condition = .x
+        fit = loess(expr ~ x * y, data = filter(dat_sim, label == condition),
+                    span = 0.02, degree = 1)
+        tidyr::crossing(x = x_seq, y = y_seq) %>%
+            mutate(interp = predict(fit, newdata = .)) %>%
+            drop_na(interp) %>%
+            mutate(label = condition)
+    })
+    range_g = quantile(plot_df$interp, c(0.01, 0.99), na.rm = TRUE)
+    plot_df$interp = pmax(pmin(plot_df$interp, range_g[2]), range_g[1])
+    brks_g = c(range_g[1] + 0.1 * diff(range_g), range_g[2] - 0.1 * diff(range_g))
+    delta_val = round(spatial_sim_genes$delta[spatial_sim_genes$gene == gene], 2)
+    p = ggplot(plot_df, aes(x = y, y = x, fill = interp)) +
+        ggtitle(paste0(gene, "  Δ=", delta_val)) +
+        geom_raster() +
+        scale_fill_distiller(name = "Expression", palette = "YlOrRd", direction = 1,limits = range_g, breaks = brks_g, labels = c("min", "max")) +
+        guides(fill = guide_colorbar(frame.colour = "black", ticks = FALSE)) +
+        coord_fixed() + theme_bw() + theme(panel.grid = element_blank()) +
+        theme(axis.title = element_blank(), axis.text = element_blank(),
+              axis.ticks = element_blank()) +
+        facet_wrap(~ label)
+    if (gene != genes_to_show[length(genes_to_show)]) p = p + theme(legend.position = "none")
+    plot_list_sim[[gene]] = p
+}
+wrap_plots(plot_list_sim, ncol = 1)
 ```
 
 **Interpret:** Do the DE genes (`truth = 1`) show a visible difference between conditions in the centre of the tissue? Do the non-DE genes look similar across conditions? Now ask: would Moran's I be able to find these DE genes?
@@ -506,17 +595,17 @@ The solution is **countsplitting** (Neufeld et al. 2022): split each cell's raw 
 ```{r}
 #| label: vespucci-sci
 #| eval: false
-sci_spatial = readRDS(file.path(DATA_DIR, "sci-spatial-mapped.rds"))
+sci_spatial = readRDS(file.path(DATA_DIR, "sci-spatial.rds"))
 counts_sc = GetAssayData(sci_spatial, layer = "counts")
 meta_sc = sci_spatial@meta.data
 
-vespucci_res = Vespucci::calculate_auc_fast(
+vespucci_res = Vespucci::run_vespucci(
     input = counts_sc,
-    meta = meta_sc,
-    label_col = "label",
-    cell_type_col = "barcode"
+    meta = meta_sc
 )
-auc_scores = setNames(vespucci_res$AUC$auc, vespucci_res$AUC$cell_type)
+de_sc = vespucci_res$de_feature_result
+auc_scores = setNames(vespucci_res$spatial_auc_result$AUC$auc,
+                      vespucci_res$spatial_auc_result$AUC$cell_type)
 meta_sc$auc_pred = auc_scores[match(meta_sc$barcode, names(auc_scores))]
 
 fit_sc = loess(auc_pred ~ x * y, data = meta_sc, span = 0.015)
@@ -542,17 +631,6 @@ ggplot(meta_sc[!is.na(meta_sc$auc_smooth), ],
 ```{r}
 #| label: vespucci-sci-de
 #| eval: false
-library(nebula)
-
-auc_df_sc = data.frame(barcode = meta_sc$barcode, auc = meta_sc$auc_pred)
-
-de_sc = Vespucci::find_spatial_de(
-    input = counts_sc,
-    meta = meta_sc,
-    auc_df = auc_df_sc,
-    barcode_col = "barcode",
-    replicate_col = "replicate"
-)
 head(de_sc, 10)
 ```
 
