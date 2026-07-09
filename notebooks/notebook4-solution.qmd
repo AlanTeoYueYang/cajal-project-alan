@@ -1,0 +1,1001 @@
+---
+title: "Notebook 4 (Extended) — Spatial Transcriptomics & Vespucci (Solutions)"
+subtitle: "CAJAL Neuromics 2026 · Spinal Cord Injury"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(spdep)
+library(ranger)
+library(pROC)
+library(Augur)
+library(Vespucci)
+library(tidyverse)
+library(randomForest)
+
+PROJ_DIR <- "/shared/projects/tp_2630_ubordeaux_neuromics_184418/projects/C14/"   # set this to your project path, e.g. "/shared/projects/.../projects/C10"
+DATA_DIR <- file.path(PROJ_DIR, "data")
+FIG_DIR  <- file.path(PROJ_DIR, "figures")
+GIT_DIR  <- "~/cajal-project-alan"   # set this to your git checkout path, e.g. "~/cajal-project-alan"
+source(file.path(GIT_DIR, "setup-quarto-visualization.R"))
+RhpcBLASctl::blas_set_num_threads(1)
+```
+
+---
+
+Single-cell RNA-seq tells you which genes change in which cell types, but it discards the one thing a tissue has that a dissociated suspension does not: **location**. A neuron in the dorsal horn and one in the ventral horn can express identical genes yet have completely different function and connectivity. Spatial transcriptomics preserves the tissue coordinate system, letting you ask *where* in the spinal cord the injury response is concentrated.
+
+This notebook starts with the standard Seurat Visium workflow to build intuition, then moves to our in-house SCI Visium data. We will see that the standard approach for finding spatially variable genes (Moran's I) has a fundamental blind spot for comparative experiments — and build up to Vespucci as the solution.
+
+---
+
+## 1. Visium basics — mouse brain tutorial
+
+We start with the 10x Genomics mouse brain anterior section, which is the standard Seurat Visium tutorial dataset. This gives us a tissue with clear spatial structure to build intuition before moving to the SCI data.
+
+```{r}
+#| label: load-brain
+brain = readRDS(file.path(DATA_DIR, "spatial-brain-seurat.rds"))
+brain = UpdateSeuratObject(brain)
+# SCTransform was already applied before saving — DefaultAssay is "SCT"
+```
+
+```{r}
+#| label: brain-qc
+#| fig-width: 12
+#| fig-height: 5
+plot1 = VlnPlot(brain, features = "nCount_Spatial", pt.size = 0.1) +
+    theme(legend.position = "none")
+plot2 = SpatialFeaturePlot(brain, features = "nCount_Spatial") +
+    theme(legend.position = "right")
+plot1 + plot2
+```
+
+The count distribution across spots is highly variable — spots overlying dense tissue (cortex, hippocampus) tend to capture more RNA. This is a technical effect of local cell density rather than biology.
+
+```{r}
+#| label: brain-genes
+#| fig-width: 12
+#| fig-height: 5
+SpatialFeaturePlot(brain,
+    features = c("Hpca", "Ttr"),
+    pt.size.factor = 1.6
+)
+```
+
+**Interpret:** Where in the brain do `Hpca` and `Ttr` localise spatially? Do they show tissue-restricted or uniform expression? What kind of genes would you expect Moran's I to pick up?
+
+`Hpca` is a hippocampal marker; `Ttr` is expressed in the choroid plexus. Both show strong spatial restriction — these are genes you would find with Moran's I. Keep this in mind when we look at the limitation later.
+
+---
+
+## 2. In-house SCI Visium data
+
+Our SCI Visium data is stored as a standard Seurat object with spatial coordinates in the metadata (`x`, `y`) rather than in the Seurat image slot. We therefore use `ggplot2` directly for all spatial plots.
+
+```{r}
+#| label: load-sci-visium
+#| eval: false
+#| fig-width: 14
+#| fig-height: 5
+sci_spatial = readRDS(file.path(DATA_DIR, "sci-spatial.rds"))
+cat("Spots:", ncol(sci_spatial), "  Genes:", nrow(sci_spatial), "\n")
+cat("Conditions:", paste(unique(sci_spatial$label), collapse = ", "), "\n")
+
+ggplot(sci_spatial@meta.data, aes(x = x, y = y, colour = label)) +
+    geom_point(size = 0.6) +
+    scale_y_reverse() +
+    coord_fixed() +
+    facet_wrap(~ label) +
+    theme_void() +
+    labs(title = "SCI Visium — spot layout by condition") +
+    theme(legend.position = "none")
+```
+
+```{r}
+#| label: sci-normalise
+#| eval: false
+sci_spatial = NormalizeData(sci_spatial, assay = "RNA", verbose = FALSE)
+```
+
+```{r}
+#| label: sci-genes-raw
+#| eval: false
+#| fig-width: 14
+#| fig-height: 8
+genes = c("Gfap", "Rbfox3")
+expr_mat = as.matrix(GetAssayData(sci_spatial, assay = "RNA", layer = "data")[genes, ])
+plot_df = do.call(rbind, lapply(genes, function(g) {
+    cbind(sci_spatial@meta.data[, c("x", "y", "label")], expr = expr_mat[g, ], gene = g)
+}))
+
+ggplot(plot_df, aes(x = x, y = y, colour = expr)) +
+    geom_point(size = 0.4) +
+    scale_colour_gradientn(colours = c("grey90", "steelblue", "navy")) +
+    scale_y_reverse() +
+    coord_fixed() +
+    facet_grid(gene ~ label) +
+    theme_void() +
+    labs(title = "Raw spot expression", colour = "log norm") +
+    theme(strip.text = element_text(size = 8))
+```
+
+Raw spots are noisy — each spot captures 1–10 cells and the expression is sparse. We can reveal the underlying spatial pattern by fitting a local regression (LOESS) surface across the tissue and predicting onto a regular grid.
+
+```{r}
+#| label: sci-genes-loess
+#| eval: false
+#| fig-width: 14
+#| fig-height: 8
+meta = sci_spatial@meta.data
+fixed_coords = expand.grid(x = seq(-400, 400, 5), y = seq(-150, 150, 5))
+
+plot_list = list()
+for (gene in genes) {
+    meta$expr = as.numeric(GetAssayData(sci_spatial, assay = "RNA", layer = "data")[gene, ])
+    conditions = unique(meta$label)
+
+    coords = map_dfr(conditions, ~ {
+        condition = .x
+        fit = loess(expr ~ x * y, data = filter(meta, label == condition), span = 0.02, degree = 1)
+        coords = tidyr::crossing(x = seq(-400, 400, 5), y = seq(-150, 150, 5)) %>% mutate(interp = predict(fit, newdata = .)) %>% drop_na(interp) %>%
+        mutate(condition = condition)
+    })
+
+    range = quantile(coords$interp, c(0.01, 0.99))
+    coords$interp = pmax(pmin(coords$interp, range[2]), range[1])
+    brks = c(range[1] + 0.1 * diff(range), range[2] - 0.1 * diff(range))
+    labels = c("min", "max")
+
+    coords$gene = gene
+    p = ggplot(coords, aes(x = x, y = y, fill = interp)) +
+        facet_grid(gene ~ condition, switch = "y") +
+        geom_raster() +
+        scale_y_reverse(expand = c(0, 0), breaks = c(-150, 150), labels = c(expression("R" %->% ""), expression("" %<-% "L")),name = gene) +
+        scale_x_continuous(expand = c(0, 0), breaks = c(-400, 400), labels = c(expression("" %<-% "Rostral"), expression("Caudal" %->% ""))) +
+        scale_fill_distiller(name = "Expression", palette = "YlOrRd", direction = 1, limits = range, breaks = brks, labels = labels) +
+        guides(fill = guide_colorbar(frame.colour = "black", ticks = FALSE)) +
+        coord_fixed() +
+        theme_bw() +
+        theme(panel.grid = element_blank()) +
+        theme(
+            axis.title.x = element_blank(),
+            axis.title.y = element_blank(),
+            axis.text.y = element_text(angle = 90, hjust = c(1, 0)),
+            axis.text.x = element_text(hjust = c(0, 1)),
+            axis.ticks.x = element_blank(),
+            axis.ticks.y = element_blank(),
+            axis.ticks.length.x = unit(0, "lines"),
+            axis.ticks.length.y = unit(0, "lines"),
+            legend.position = "right",
+            legend.justification = "bottom",
+            legend.key.width = unit(0.18, "lines"),
+            legend.key.height = unit(0.18, "lines")
+        )
+    if (gene != genes[1]) p = p + theme(strip.text.x = element_blank())
+    if (gene != genes[length(genes)]) p = p + theme(legend.position = "none")
+    plot_list[[gene]] = p
+}
+wrap_plots(plot_list, ncol = 1)
+```
+
+**Interpret:** Which genes show the sharpest spatial boundary in the interpolated surface? Does the pattern shift between conditions? What cell types do you think each gene marks, and what does this tell you about the anatomy of the spinal cord sections?
+
+`Gfap` (astrocytes) and `Iba1` (microglia) mark the glial scar. `Rbfox3` (NeuN, neurons) and `Col1a1` (fibroblasts) help locate grey vs white matter and meninges. The interpolated surface makes the spatial gradients much clearer — Gfap and Rbfox3 tend to show the sharpest boundaries, and the pattern shifts between conditions in the glial scar markers.
+
+---
+
+## 3. Cell type deconvolution — RCTD (Demo)
+
+Each Visium spot is ~55 µm in diameter and captures RNA from 1–10 cells. The measured expression is a mixture of whatever cell types happen to sit under that spot. Before interpreting spatial gene expression, we need to know *which cell types are where*.
+
+**RCTD** (Robust Cell Type Decomposition, Cable et al. 2022) solves this by fitting a Poisson model to each spot's counts using our annotated scRNA-seq atlas as a reference. The `spacexr` package is not installed in the course environment so RCTD was run offline; we load the pre-computed proportions here.
+
+### How RCTD was run
+
+RCTD needs two ingredients: a **puck** (the spatial data — counts, spot coordinates, per-spot UMI) and a **reference** (the annotated snRNA-seq atlas — counts, per-cell type label, per-cell UMI). `create.RCTD()` fits the model; `run.RCTD(..., doublet_mode = "full")` returns a full weight vector per spot rather than just the top 1–2 cell types, which suits Visium spots that mix several cells. This was run once per condition (`label`) and once per annotation resolution (`layer1`, `layer2`, `layer3`), and the results row-bound into the long-format `sci-spatial-rctd.rds` table loaded below.
+
+```{r}
+#| label: rctd-run
+#| eval: false
+library(spacexr)
+
+## Build the spatial puck for one condition
+sp = readRDS(file.path(DATA_DIR, "sci-spatial.rds"))
+sp = sp[, sp@meta.data %>% filter(label == "uninjured") %>% pull(barcode)]
+coords = sp@meta.data %>% dplyr::select(x, y)
+
+sp_counts = GetAssayData(sp, layer = "counts")
+nUMI_sp = colSums(sp_counts)
+names(nUMI_sp) = rownames(coords)
+
+puck = SpatialRNA(coords, sp_counts, nUMI_sp)
+
+## Build the snRNA-seq reference for one annotation resolution
+sc = readRDS(file.path(DATA_DIR, "sci-subset-atlas-annotated.rds"))
+
+meta = sc@meta.data %>%
+    rename(layer = layer1) %>%
+    dplyr::select(nCount_RNA, nFeature_RNA, layer, barcode) %>%
+    group_by(layer) %>%
+    dplyr::filter(n() > 25) %>%   # RCTD requires >25 cells per reference cell type
+    ungroup()
+
+sc_counts = GetAssayData(sc, layer = "counts")[, meta$barcode]
+
+cell_type_dict = meta %>%
+    distinct(layer) %>%
+    drop_na() %>%
+    mutate(cluster_idx = row_number())
+
+cell_type = meta %>%
+    left_join(cell_type_dict, by = "layer") %>%
+    mutate(layer = factor(cluster_idx, levels = cluster_idx, labels = layer)) %>%
+    pull(layer)
+names(cell_type) = meta$barcode
+
+nUMI_sc = colSums(sc_counts)
+names(nUMI_sc) = meta$barcode
+
+reference = Reference(sc_counts, cell_type, nUMI_sc)
+
+## Fit and run RCTD
+myRCTD = create.RCTD(
+    puck, reference,
+    max_cores = 10,
+    gene_cutoff = 0.000125, 
+    gene_cutoff_reg = 0.0002,
+    fc_cutoff = 0.5, 
+    fc_cutoff_reg = 0.75,
+    UMI_min = 100, 
+    UMI_max = 2e7
+)
+
+myRCTD = run.RCTD(myRCTD, doublet_mode = "full")
+
+## Reshape to the long format used downstream: barcode x cell_type x weight x resolution
+weights = as.data.frame(normalize_weights(myRCTD@results$weights))
+weights$barcode = rownames(weights)
+
+rctd_res_layer1_uninjured = weights %>%
+    pivot_longer(-barcode, names_to = "cell_type", values_to = "weight") %>%
+    mutate(resolution = "layer1")
+# Repeat for every label x {layer1, layer2, layer3} combination, then
+# bind_rows() the pieces and saveRDS() to build sci-spatial-rctd.rds.
+```
+
+```{r}
+#| label: rctd-load
+#| eval: false
+rctd_res = readRDS(file.path(DATA_DIR, "sci-spatial-rctd.rds"))
+# Long format: barcode × cell_type × weight × resolution
+head(rctd_res)
+
+# Join spatial coordinates
+meta_coords = sci_spatial@meta.data[, c("barcode", "x", "y", "label")]
+rctd_res = merge(rctd_res, meta_coords, by = "barcode")
+```
+
+```{r}
+#| label: rctd-plot
+#| eval: false
+# Plot Immune cells (layer1) as a LOESS-smoothed spatial map
+immune = rctd_res[rctd_res$cell_type == "Immune cells" & rctd_res$resolution == "layer1", ]
+
+plot_df_rctd = map_dfr(unique(immune$label), ~ {
+    condition = .x
+    fit = loess(weight ~ x * y, data = filter(immune, label == condition), span = 0.02, degree = 1)
+    tidyr::crossing(x = seq(-400, 400, 5), y = seq(-150, 150, 5)) %>%
+        mutate(interp = predict(fit, newdata = .)) %>%
+        drop_na(interp) %>%
+        mutate(condition = condition)
+})
+
+range_rctd = quantile(plot_df_rctd$interp, c(0.01, 0.99))
+plot_df_rctd$interp = pmax(pmin(plot_df_rctd$interp, range_rctd[2]), range_rctd[1])
+brks_rctd = c(range_rctd[1] + 0.1 * diff(range_rctd), range_rctd[2] - 0.1 * diff(range_rctd))
+
+ggplot(plot_df_rctd, aes(x = x, y = y, fill = interp)) +
+    geom_raster() +
+    scale_y_reverse(expand = c(0, 0), breaks = c(-150, 150), labels = c(expression("R" %->% ""), expression("" %<-% "L"))) +
+    scale_x_continuous(expand = c(0, 0), breaks = c(-400, 400), labels = c(expression("" %<-% "Rostral"), expression("Caudal" %->% ""))) +
+    scale_fill_distiller(name = "Weight", palette = "Greys", direction = 1, limits = range_rctd, breaks = brks_rctd, labels = c("min", "max")) +
+    guides(fill = guide_colorbar(frame.colour = "black", ticks = FALSE)) +
+    coord_fixed() +
+    facet_wrap(~ condition) +
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          axis.title = element_blank(),
+          axis.text.y = element_text(angle = 90, hjust = c(1, 0)),
+          axis.text.x = element_text(hjust = c(0, 1)),
+          axis.ticks = element_blank()) +
+    labs(title = "Immune cells (RCTD layer1)")
+```
+
+**Interpret:** Do the RCTD cell type proportions align with the tissue anatomy — neurons in grey matter, oligodendrocytes in white matter? Does the injured section show a shift in immune cell accumulation compared to uninjured?
+
+**Explore:** Do the RCTD cell type proportions match the known anatomy of spinal cord sections — neurons concentrated in grey matter, oligodendrocytes in white matter, microglia more diffuse? Which spots show the highest immune cell fraction, and does this align with the injury site?
+
+RCTD typically places neurons in the dorsal and ventral horns (grey matter) and oligodendrocytes in the lateral and dorsal white matter columns. Spots with high microglial fraction near the lesion centre reflect the glial scar. Deviations from expected anatomy can point to tissue damage or transcriptional reprogramming.
+
+---
+
+## 4. Spatially variable genes — Moran's I
+
+Now that we know *which cells are where*, we want to know *which genes vary spatially*. The standard statistic is **Moran's I**.
+
+For a gene with expression vector **x** across N spots with spatial weight matrix **W**:
+
+$$I = \frac{N}{W_0} \cdot \frac{\mathbf{x}^\top \mathbf{W}\, \mathbf{x}}{\mathbf{x}^\top \mathbf{x}}$$
+
+I = 1: nearby spots are similar (spatial clustering). I = 0: random. I = −1: checkerboard.
+
+```{r}
+#| label: moran-brain
+brain = FindSpatiallyVariableFeatures(brain,
+    features = VariableFeatures(brain)[1:100],
+    selection.method = "moransi")
+
+head(SpatiallyVariableFeatures(brain, method = "moransi"), 10)
+```
+
+```{r}
+#| label: moran-brain-plot
+#| fig-width: 18
+#| fig-height: 12
+top_svgs = head(SpatiallyVariableFeatures(brain, method = "moransi"), 6)
+
+svg_plots = lapply(top_svgs, function(g) {
+    SpatialFeaturePlot(brain, features = g, pt.size.factor = 1.4) +
+        labs(title = g) +
+        theme(plot.title = element_text(size = 9), legend.position = "none")
+})
+wrap_plots(svg_plots, ncol = 3)
+```
+
+**Interpret:** Do the top SVGs match known brain anatomy — do their spatial patterns correspond to recognizable brain structures? What does this tell you about what Moran's I is good at detecting?
+
+The top SVGs match known brain anatomy. This confirms Moran's I works well for detecting spatially restricted expression within a single tissue section.
+
+---
+
+## 5. The blind spot: condition-specific spatial expression
+
+### The problem
+
+Moran's I measures spatial autocorrelation **within a single tissue section**. It detects genes that cluster in space *within one condition*. But genes that are differentially expressed between conditions only in a specific spatial region — for example, the centre of the spinal cord — have no spatial structure when you examine each condition in isolation. Moran's I is blind to condition-specific spatial patterns.
+
+### Simulation
+
+We use a pre-built simulation: 10,000 cells scattered across a 2D tissue, two conditions (`Perturbation_1`, `Perturbation_2`). A circle of 705 cells in the centre is selectively perturbed — 20% of genes (`truth = 1`) are differentially expressed between conditions **only in this perturbed region**. The remaining 80% of genes (`truth = 0`) are unchanged.
+
+```{r}
+#| label: sim-load
+spatial_sim = readRDS(file.path(DATA_DIR, "spatial-simulation-circle.rds"))
+spatial_sim_genes = readRDS(file.path(DATA_DIR, "spatial-simulation-circle-de-genes.rds"))
+meta_sim = spatial_sim@meta.data
+cat("Cells:", ncol(spatial_sim), "  Genes:", nrow(spatial_sim), "\n")
+cat("DE genes:", sum(spatial_sim_genes$truth), "  Non-DE:", sum(spatial_sim_genes$truth == 0), "\n")
+```
+
+```{r}
+#| label: sim-setup
+#| fig-width: 7
+#| fig-height: 4
+label_pal = c(Perturbation_1 = '#F4F27E', Perturbation_2 = '#372367')
+
+p_label = ggplot(meta_sim, aes(x = y, y = x, fill = label)) +
+    geom_point(shape = 21, stroke = NA, size = 0.3) +
+    scale_fill_manual(values = label_pal, name = 'Condition') +
+    guides(fill = guide_legend(override.aes = list(size = 1.5))) +
+    coord_fixed() + theme_bw() +
+    theme(panel.grid = element_blank(), axis.title = element_blank(),
+          axis.text = element_blank(), axis.ticks = element_blank(),
+          legend.position = 'top')
+
+p_circle = meta_sim %>%
+    mutate(label_sim = factor(label_sim, levels = c('background', 'perturbed')),
+           label_sim = as.integer(label_sim)) %>%
+    ggplot(aes(x = y, y = x, fill = label_sim, color = label_sim)) +
+    ggtitle('Ground truth: perturbed region') +
+    geom_point(size = 0.5, shape = 21, stroke = 0) +
+    scale_fill_gradientn(colours = c('grey90', '#2166AC'), name = 'Perturbation',breaks = c(1, 2), labels = c('background', 'perturbed')) +
+    scale_color_gradientn(colours = c('grey90', '#2166AC'), name = 'Perturbation',breaks = c(1, 2), labels = c('background', 'perturbed')) +
+    guides(fill = guide_colorbar(frame.colour = 'black', ticks = FALSE), color = guide_colorbar(frame.colour = 'black', ticks = FALSE)) +
+    coord_fixed() + theme_bw() +
+    theme(panel.grid = element_blank(), axis.title = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(), legend.position = 'top')
+
+p_label | p_circle
+```
+
+Now plot the spatial expression of top 3 DE genes (`truth = 1`) by delta mean. We fit a LOESS surface within each condition and predict onto a regular grid — this reveals the circle pattern that is invisible in raw scattered points.
+
+```{r}
+#| label: sim-genes
+#| fig-width: 10
+#| fig-height: 12
+# SCTransform already applied — select genes by fold change magnitude
+spatial_sim_genes$delta = abs(spatial_sim_genes$GeneMean - spatial_sim_genes$BaseGeneMean)
+genes_to_show = head(spatial_sim_genes$gene[order(-spatial_sim_genes$delta)], 3)
+
+dat_sim = meta_sim[, c('x', 'y', 'label')]
+expr_mat = as.matrix(GetAssayData(spatial_sim, assay = "SCT", layer = 'data')[genes_to_show, ])
+
+x_seq = seq(floor(min(dat_sim$x)), ceiling(max(dat_sim$x)), length.out = 80)
+y_seq = seq(floor(min(dat_sim$y)), ceiling(max(dat_sim$y)), length.out = 80)
+
+plot_list_sim = list()
+for (gene in genes_to_show) {
+    dat_sim$expr = expr_mat[gene, rownames(dat_sim)]
+    plot_df = map_dfr(unique(dat_sim$label), ~ {
+        condition = .x
+        fit = loess(expr ~ x * y, data = filter(dat_sim, label == condition),
+                    span = 0.02, degree = 1)
+        tidyr::crossing(x = x_seq, y = y_seq) %>%
+            mutate(interp = predict(fit, newdata = .)) %>%
+            drop_na(interp) %>%
+            mutate(label = condition)
+    })
+    range_g = quantile(plot_df$interp, c(0.01, 0.99), na.rm = TRUE)
+    plot_df$interp = pmax(pmin(plot_df$interp, range_g[2]), range_g[1])
+    brks_g = c(range_g[1] + 0.1 * diff(range_g), range_g[2] - 0.1 * diff(range_g))
+    delta_val = round(spatial_sim_genes$delta[spatial_sim_genes$gene == gene], 2)
+    p = ggplot(plot_df, aes(x = y, y = x, fill = interp)) +
+        ggtitle(paste0(gene, "  Δ=", delta_val)) +
+        geom_raster() +
+        scale_fill_distiller(name = "Expression", palette = "YlOrRd", direction = 1,limits = range_g, breaks = brks_g, labels = c("min", "max")) +
+        guides(fill = guide_colorbar(frame.colour = "black", ticks = FALSE)) +
+        coord_fixed() + theme_bw() + theme(panel.grid = element_blank()) +
+        theme(axis.title = element_blank(), axis.text = element_blank(),
+              axis.ticks = element_blank()) +
+        facet_wrap(~ label)
+    if (gene != genes_to_show[length(genes_to_show)]) p = p + theme(legend.position = "none")
+    plot_list_sim[[gene]] = p
+}
+wrap_plots(plot_list_sim, ncol = 1)
+```
+
+**Interpret:** Do the DE genes (`truth = 1`) show a visible difference between conditions in the centre of the tissue? Do the non-DE genes look similar across conditions? Now ask: would Moran's I be able to find these DE genes?
+
+DE genes show a clear difference between conditions in the circle region — the centre of the tissue looks different in `Perturbation_1` vs `Perturbation_2`. Non-DE genes look nearly identical across conditions. However, within any single condition, the DE genes do not show strong spatial autocorrelation — the circle only becomes visible when you compare across conditions. This is exactly the blind spot that Moran's I cannot detect.
+
+### Moran's I on the simulation
+
+We run Moran's I across both conditions pooled to find spatially variable genes, then check how well those rankings recover the known DE genes.
+
+```{r}
+#| label: sim-moran
+spatial_sim = FindSpatiallyVariableFeatures(spatial_sim,
+    features = VariableFeatures(spatial_sim),
+    selection.method = "moransi")
+
+svf_meta = spatial_sim@assays[["SCT"]]@meta.features
+moran_sim_res = data.frame(gene = rownames(svf_meta), I = svf_meta$MoransI_observed)
+moran_sim_res = merge(moran_sim_res, spatial_sim_genes[, c("gene", "truth")], by = "gene")
+moran_sim_res = moran_sim_res[!is.na(moran_sim_res$I), ]
+
+prc_moran = compute_prc(moran_sim_res$I, moran_sim_res$truth)
+cat("Moran's I AUPRC for detecting DE genes:", round(auprc(prc_moran), 3), "\n")
+cat("Random baseline AUPRC:", round(mean(moran_sim_res$truth), 3), "\n")
+```
+
+**Interpret:** How does the Moran's I AUPRC compare to the random baseline of 0.5? What does this tell you about whether spatial autocorrelation within one condition can detect genes that are differentially expressed between conditions?
+
+A perfect method would have AUPRC = 1.0. The random baseline is 0.5. If Moran's I AUPRC is near the baseline, it means the spatial autocorrelation score within one condition does not separate condition-specific DE genes from background — confirming the blind spot.
+
+---
+
+## 6. Vespucci — spatial perturbation mapping
+
+### Step 1: The naive approach — Augur at a single barcode
+
+The ideal solution: for each barcode **b**, collect its 50 nearest cells from each condition (by spatial distance) and run `calculate_auc_fast` on those ~100 cells to get a local AUC. Let us see how long that takes for one barcode.
+
+```{r}
+#| label: vespucci-one-barcode
+# Build the spatial neighbourhood graph once — shared by all subsequent steps.
+# For each barcode, store the 100 nearest neighbours with their labels and ranks.
+nn_df = Vespucci::get_nn(meta_sim)
+
+# Helper: run calculate_auc_fast on the k nearest cells from each condition
+run_augur_at_barcode = function(bc, k = 50, n_subsamples = 10) {
+    barcodes_keep = nn_df %>%
+        filter(source_barcode == bc) %>%
+        group_by(target_label) %>%
+        arrange(neighbor_idx) %>%
+        slice_head(n = k) %>%
+        pull(target_barcode)
+    if (length(unique(meta_sim[barcodes_keep, "label"])) < 2 ||
+        min(table(meta_sim[barcodes_keep, "label"])) < 20) return(NA_real_)
+    meta0 = meta_sim[barcodes_keep, , drop = FALSE]
+    meta0$cell_type = "vespucci"
+    res = Vespucci::calculate_auc_fast(
+        input = GetAssayData(spatial_sim, layer = "counts")[, barcodes_keep],
+        meta = meta0,
+        label_col = "label",
+        n_subsamples = n_subsamples,
+        select_var = FALSE,
+        n_threads = 1,
+        show_progress = FALSE
+    )
+    res$AUC$auc[1]
+}
+
+bc_example = rownames(meta_sim)[1]
+t0 = proc.time()["elapsed"]
+auc_one = run_augur_at_barcode(bc_example)
+t_one = proc.time()["elapsed"] - t0
+cat(sprintf("1 barcode: %.1f s  ->  %d barcodes: ~%.0f hours\n", t_one, ncol(spatial_sim), t_one * ncol(spatial_sim) / 3600))
+```
+
+At this rate, covering all barcodes is computationally infeasible. We need a smarter approach.
+
+---
+
+### Step 2: Build a small training set
+
+Run `calculate_auc_fast` on 10 randomly sampled barcodes. These become our **labelled training examples** — barcodes for which we know the true local AUC.
+
+```{r}
+#| label: vespucci-train-augur
+set.seed(42)
+train_barcodes = sample(rownames(meta_sim), 10)
+
+calculated_auc_df = map_dfr(train_barcodes, function(bc) {
+    data.frame(barcode = bc, auc = run_augur_at_barcode(bc))
+}) %>% filter(!is.na(auc))
+calculated_auc_df
+```
+
+---
+
+### Step 3: Distance metrics via `get_distance_metrics`
+
+Instead of running Augur everywhere, Vespucci approximates each barcode's local AUC using cheap pairwise expression statistics. For each barcode, it looks at its k nearest cells from the **opposing condition** and summarises how transcriptomically similar they are — using Pearson and Spearman correlation, each summarised as mean / median / Q1 / Q3 / SD across all cross-condition pairs.
+
+```{r}
+#| label: vespucci-distance-metrics
+# distance_metrics_df = Vespucci::get_distance_metrics(
+#     input = GetAssayData(spatial_sim, layer = "counts"),
+#     meta = data.frame(
+#         label = meta_sim$label,
+#         barcode = meta_sim$barcode,
+#         row.names = rownames(meta_sim)),
+#     nn = nn_df,
+#     k = 50,
+#     label_col = "label",
+#     barcode_col = "barcode",
+#     dismay_methods = c("pearson", "spearman"),
+#     select_var = TRUE,
+#     ncores = 1
+# )
+distance_metrics_df = readRDS(file.path(DATA_DIR,'spatial-simulation-circle-distance-metrics.rds'))
+features = setdiff(colnames(distance_metrics_df), "barcode")
+cat("Features:", length(features), "--", paste(head(features, 6), collapse = ", "), "...\n")
+```
+
+---
+
+### Step 4: Convergence loop
+
+With distance metrics for all barcodes and true AUCs for our 10 training barcodes, we train a `randomForest` meta-classifier. We then sample 10 new barcodes, run `calculate_auc_fast` on each, retrain, and re-predict — repeating until the correlation between successive predictions plateaus.
+
+```{r}
+#| label: vespucci-convergence
+set.seed(1)
+barcodes_per_step = 10
+min_cor = 0.99
+epsilon = 0.01
+steps_tracking = 3
+
+remaining_bcs = setdiff(rownames(meta_sim), calculated_auc_df$barcode)
+converged = FALSE
+step_count = 1
+prev_auc_vals = NULL
+prev_cor = NULL
+steps_tracking_count = 0
+cor_tracking = data.frame()
+
+while (!converged && length(remaining_bcs) >= barcodes_per_step) {
+    print(steps_tracking_count)
+    new_batch = sample(remaining_bcs, barcodes_per_step)
+    remaining_bcs = setdiff(remaining_bcs, new_batch)
+
+    new_aucs = map_dfr(new_batch, function(bc) {
+        data.frame(barcode = bc, auc = run_augur_at_barcode(bc))
+    }) %>% filter(!is.na(auc))
+    calculated_auc_df = rbind(calculated_auc_df, new_aucs)
+
+    training_data = distance_metrics_df %>%
+        left_join(calculated_auc_df, by = "barcode") %>%
+        filter(!is.na(auc))
+
+    rf_fit = randomForest::randomForest(auc ~ ., data = training_data[, c(features, "auc")])
+    auc_vals = as.numeric(predict(rf_fit, as.data.frame(distance_metrics_df[, features])))
+
+    if (step_count == 1) {
+        cor_tracking = data.frame(step = step_count, n_train = nrow(training_data), cor = NA)
+    } else {
+        r = cor(auc_vals, prev_auc_vals, use = "complete.obs")
+        message("Step ", step_count, ": cor = ", round(r, 3))
+        cor_tracking = rbind(cor_tracking, data.frame(step = step_count, n_train = nrow(training_data), cor = r))
+        if (!is.null(prev_cor)) {
+            if ((r - prev_cor) <= epsilon) steps_tracking_count = steps_tracking_count + 1
+            else steps_tracking_count = 0
+            if (steps_tracking_count >= steps_tracking && r >= min_cor) converged = TRUE
+        }
+        prev_cor = r
+    }
+    prev_auc_vals = auc_vals
+    step_count = step_count + 1
+}
+```
+
+```{r}
+#| label: vespucci-convergence-plot
+#| fig-width: 8
+#| fig-height: 5
+ggplot(cor_tracking[!is.na(cor_tracking$cor), ], aes(x = n_train, y = cor)) +
+    geom_line() + geom_point(size = 2) +
+    scale_x_continuous("Training barcodes") +
+    scale_y_continuous("Correlation with previous step") +
+    theme_bw() + theme(panel.grid.minor = element_blank()) +
+    labs(title = "Convergence of Vespucci meta-classifier")
+```
+
+Once the correlation plateaus near 1, the meta-classifier has learned a stable mapping from expression statistics to AUC. We take the final predictions as the **spatial perturbation map**.
+
+```{r}
+#| label: vespucci-final-map
+#| fig-width: 5
+#| fig-height: 5
+meta_sim$auc_pred = prev_auc_vals[match(meta_sim$barcode, distance_metrics_df$barcode)]
+
+fit_auc = loess(auc_pred ~ x * y, data = meta_sim, span = 0.015)
+meta_sim$auc_smooth = predict(fit_auc, meta_sim)
+rng = range(meta_sim$auc_smooth, na.rm = TRUE)
+brks = c(rng[1] + 0.1 * diff(rng), rng[2] - 0.1 * diff(rng))
+
+ggplot(meta_sim[!is.na(meta_sim$auc_smooth), ],
+       aes(x = y, y = x, fill = auc_smooth, color = auc_smooth)) +
+    ggtitle("Vespucci -- spatial perturbation map (converged)") +
+    geom_point(size = 0.3, shape = 21, stroke = 0) +
+    scale_fill_distiller(name = "AUC", palette = "RdYlBu", direction = -1, limits = rng, breaks = brks, labels = format(rng, digits = 2)) +
+    scale_color_distiller(name = "AUC", palette = "RdYlBu", direction = -1, limits = rng, breaks = brks, labels = format(rng, digits = 2)) +
+    guides(fill = guide_colorbar(frame.colour = "black", ticks = FALSE),
+           color = guide_colorbar(frame.colour = "black", ticks = FALSE)) +
+    coord_fixed() + theme_bw() + theme(panel.grid = element_blank(),
+          axis.title = element_blank(), axis.text = element_blank(),
+          axis.ticks = element_blank(), legend.position = "right",
+          legend.justification = "bottom",
+          legend.key.width = unit(0.18, "lines"),
+          legend.key.height = unit(0.18, "lines"))
+```
+
+**Interpret:** Compare this map to the ground truth circle. Does the perturbed region emerge as a spatially coherent high-AUC island? How precisely does Vespucci localise the perturbation signal, and how does this compare to what Moran's I found?
+
+The perturbed region emerges as a spatially coherent high-AUC island that closely matches the ground truth circle. Vespucci has localised where the two conditions differ without ever running Augur on all 10,000 barcodes — the meta-classifier generalized from a small training set to the full tissue.
+
+**Explore:** Compare the Vespucci AUC spatial map to the RCTD cell type map. Are the high-AUC regions (most perturbed spots) enriched for particular cell types? What does this tell you about which cell types drive the spatial injury response?
+
+High Vespucci AUC spots often co-localise with regions of mixed microglia and astrocyte enrichment — the glial scar. If neuronal spots show lower AUC than glial spots, it suggests the glial response is more spatially focal than the neuronal response. Cross-referencing Vespucci with RCTD turns the Vespucci map from a statistical summary into a cell-type-resolved spatial picture.
+
+---
+
+### Step 5: Finding DE genes — NBGMM across conditions
+
+With `nebula`, we fit a negative-binomial generalized mixed model (NBGMM) per gene, testing for a `label` (condition) effect while including `replicate` as a random effect. This is a standard whole-tissue DE test between conditions — it does not use the spatial AUC map from steps 1–4.
+
+```{r}
+#| label: vespucci-de
+library(nebula)
+
+input = GetAssayData(spatial_sim, layer = "counts")
+all(colnames(input) == rownames(meta_sim))
+df = model.matrix(~label, data=meta_sim)
+data_g = group_cell(count=input,id=meta_sim$replicate,pred=df)
+de_res = nebula(
+    data_g$count,
+    data_g$id,
+    pred=data_g$pred,
+    model = 'NBGMM',
+    cpc = 0
+)
+de_sim = de_res$summary
+names(de_sim)[names(de_sim) == "gene"] = "feature"
+p_col = grep("^p_label", names(de_sim), value = TRUE)[1]
+de_sim$p_val_adj = p.adjust(de_sim[[p_col]], method = "BH")
+de_sim = de_sim[order(de_sim$p_val_adj), ]
+head(de_sim, 10)
+```
+
+```{r}
+#| label: vespucci-de-plot
+#| fig-width: 12
+#| fig-height: 14
+top_de_genes = head(de_sim$feature[de_sim$p_val_adj < 0.05], 6)
+dat_de = meta_sim[, c("x", "y", "label")]
+
+x_seq_de = seq(floor(min(dat_de$x)), ceiling(max(dat_de$x)), length.out = 80)
+y_seq_de = seq(floor(min(dat_de$y)), ceiling(max(dat_de$y)), length.out = 80)
+
+expr_mat_de = as.matrix(GetAssayData(spatial_sim, assay = "SCT", layer = "data")[top_de_genes, rownames(dat_de)])
+
+de_plots = lapply(top_de_genes, function(gene) {
+    dat_de$expr = expr_mat_de[gene, rownames(dat_de)]
+    plot_df = map_dfr(unique(dat_de$label), ~ {
+        fit = loess(expr ~ x * y, data = filter(dat_de, label == .x), span = 0.02, degree = 1)
+        tidyr::crossing(x = x_seq_de, y = y_seq_de) %>%
+            mutate(interp = predict(fit, newdata = .), label = .x) %>%
+            drop_na(interp)
+    })
+    rng_g = quantile(plot_df$interp, c(0.01, 0.99), na.rm = TRUE)
+    plot_df$interp = pmax(pmin(plot_df$interp, rng_g[2]), rng_g[1])
+    brks_g = c(rng_g[1] + 0.1 * diff(rng_g), rng_g[2] - 0.1 * diff(rng_g))
+    ggplot(plot_df, aes(x = y, y = x, fill = interp)) +
+        ggtitle(gene) +
+        geom_raster() +
+        scale_fill_distiller(name = "Expression", palette = "YlOrRd", direction = 1,limits = rng_g, breaks = brks_g, labels = c("min", "max")) +
+        guides(fill = guide_colorbar(frame.colour = "black", ticks = FALSE)) +
+        scale_x_continuous(expand = c(0, 0)) + scale_y_continuous(expand = c(0, 0)) +
+        coord_fixed() + theme_bw() + theme(panel.grid = element_blank(),
+              axis.title = element_blank(), axis.text = element_blank(),
+              axis.ticks = element_blank()) +
+        facet_wrap(~ label)
+})
+wrap_plots(de_plots, ncol = 2)
+```
+
+---
+
+### A note on data independence: countsplitting
+
+The `vespucci-de` step above sidesteps a subtle issue by testing against the raw `label` column rather than the derived AUC values — so its input (raw counts) and predictor (condition) are independent of the AUC-map-fitting steps (1–4). But `Vespucci::run_vespucci()`, used on the SCI atlas in Section 7, is different: internally it fits the AUC map from the raw counts *and* runs its DE test using those AUC values as the predictor. Because both stages draw on the same expression matrix, the DE test is not independent of the AUC-fitting step — the model has effectively seen the same data twice, which is **data leakage** and inflates false positives.
+
+The fix is **countsplitting** (Neufeld et al. 2022): split each cell's raw UMI counts into two independent halves (exploiting the Poisson splitting property). Use one half to fit the AUC map; use the other half for the DE test. The two halves are statistically independent, so the DE test is valid.
+
+---
+
+## 7. Apply Vespucci to the SCI atlas
+
+```{r}
+#| label: vespucci-sci
+#| eval: false
+#| fig-width: 5
+#| fig-height: 5
+sci_spatial = readRDS(file.path(DATA_DIR, "sci-spatial.rds"))
+counts_sc = GetAssayData(sci_spatial, layer = "counts")
+meta_sc = sci_spatial@meta.data
+
+vespucci_res = Vespucci::run_vespucci(
+    input = counts_sc,
+    meta = meta_sc
+)
+de_sc = vespucci_res$de_feature_result
+auc_scores = setNames(vespucci_res$spatial_auc_result$AUC$auc,
+                      vespucci_res$spatial_auc_result$AUC$cell_type)
+meta_sc$auc_pred = auc_scores[match(meta_sc$barcode, names(auc_scores))]
+
+fit_sc = loess(auc_pred ~ x * y, data = meta_sc, span = 0.015)
+plot_df_sc = tidyr::crossing(x = seq(-400, 400, 5), y = seq(-150, 150, 5)) %>%
+    mutate(interp = predict(fit_sc, newdata = .)) %>%
+    drop_na(interp)
+
+rng_sc = range(plot_df_sc$interp, na.rm = TRUE)
+brks_sc = c(rng_sc[1] + 0.1 * diff(rng_sc), rng_sc[2] - 0.1 * diff(rng_sc))
+
+ggplot(plot_df_sc, aes(x = x, y = y, fill = interp)) +
+    ggtitle("Vespucci -- spatial perturbation map (SCI)") +
+    geom_raster() +
+    scale_y_reverse(expand = c(0, 0), breaks = c(-150, 150), labels = c(expression("R" %->% ""), expression("" %<-% "L"))) +
+    scale_x_continuous(expand = c(0, 0), breaks = c(-400, 400), labels = c(expression("" %<-% "Rostral"), expression("Caudal" %->% ""))) +
+    scale_fill_distiller(name = "AUC", palette = "RdYlBu", direction = -1, limits = rng_sc, breaks = brks_sc, labels = format(rng_sc, digits = 2)) +
+    guides(fill = guide_colorbar(frame.colour = "black", ticks = FALSE)) +
+    coord_fixed() + theme_bw() +
+    theme(panel.grid = element_blank(), axis.title = element_blank(),
+          axis.text.y = element_text(angle = 90, hjust = c(1, 0)),
+          axis.text.x = element_text(hjust = c(0, 1)),
+          axis.ticks = element_blank(),
+          legend.position = "right", legend.justification = "bottom",
+          legend.key.width = unit(0.18, "lines"), legend.key.height = unit(0.18, "lines"))
+```
+
+```{r}
+#| label: vespucci-sci-de
+#| eval: false
+
+head(de_sc, 10)
+```
+
+```{r}
+#| label: vespucci-sci-de-plot
+#| eval: false
+#| fig-width: 12
+#| fig-height: 14
+sci_spatial = NormalizeData(sci_spatial, assay = "RNA", verbose = FALSE)
+top_de_sc = head(de_sc$feature[de_sc$p_val_adj < 0.05], 6)
+meta_sc_plot = meta_sc[, c("x", "y", "label")]
+
+norm_sc = as.matrix(GetAssayData(sci_spatial, assay = "RNA", layer = "data"))
+
+de_sc_plots = lapply(top_de_sc, function(gene) {
+    meta_sc_plot$expr = norm_sc[gene, rownames(meta_sc_plot)]
+    plot_df = map_dfr(unique(meta_sc_plot$label), ~ {
+        fit = loess(expr ~ x * y, data = filter(meta_sc_plot, label == .x),
+                    span = 0.02, degree = 1)
+        tidyr::crossing(x = seq(-400, 400, 5), y = seq(-150, 150, 5)) %>%
+            mutate(interp = predict(fit, newdata = .), label = .x) %>%
+            drop_na(interp)
+    })
+    rng_g = quantile(plot_df$interp, c(0.01, 0.99), na.rm = TRUE)
+    plot_df$interp = pmax(pmin(plot_df$interp, rng_g[2]), rng_g[1])
+    brks_g = c(rng_g[1] + 0.1 * diff(rng_g), rng_g[2] - 0.1 * diff(rng_g))
+    ggplot(plot_df, aes(x = x, y = y, fill = interp)) +
+        ggtitle(gene) +
+        geom_raster() +
+        scale_fill_distiller(name = "Expression", palette = "YlOrRd", direction = 1,limits = rng_g, breaks = brks_g, labels = c("min", "max")) +
+        guides(fill = guide_colorbar(frame.colour = "black", ticks = FALSE)) +
+        scale_x_continuous(expand = c(0, 0)) + scale_y_reverse(expand = c(0, 0)) +
+        coord_fixed() + theme_bw() + theme(panel.grid = element_blank(),
+              axis.title = element_blank(), axis.text = element_blank(),
+              axis.ticks = element_blank()) +
+        facet_wrap(~ label)
+})
+wrap_plots(de_sc_plots, ncol = 2)
+```
+
+```{r}
+#| label: vespucci-sci-clusters
+#| eval: false
+# Cluster DE genes by their spatial expression pattern
+sig_genes = de_sc$feature[de_sc$p_val_adj < 0.05]
+
+genes_cluster_df = Vespucci::find_de_clusters(
+    input = norm_sc,
+    meta = meta_sc,
+    de_genes = sig_genes,
+    barcode_col = "barcode",
+    norm = FALSE
+)
+table(genes_cluster_df$cluster)
+```
+
+```{r}
+#| label: vespucci-sci-cluster-plot
+#| eval: false
+#| fig-width: 12
+#| fig-height: 10
+# Spatial map: mean expression of each gene cluster per spot
+cluster_ids = sort(unique(genes_cluster_df$cluster))
+
+cluster_spatial = map_dfr(cluster_ids, function(cl) {
+    cl_genes = genes_cluster_df$gene[genes_cluster_df$cluster == cl]
+    mean_expr = colMeans(norm_sc[cl_genes, meta_sc$barcode, drop = FALSE])
+    data.frame(barcode = names(mean_expr), mean_expr = mean_expr, cluster = paste0("Cluster ", cl))
+}) %>% left_join(meta_sc[, c("barcode", "x", "y")], by = "barcode")
+
+cluster_plots = lapply(unique(cluster_spatial$cluster), function(cl) {
+    df = filter(cluster_spatial, cluster == cl)
+    fit = loess(mean_expr ~ x * y, data = df, span = 0.015)
+    df$smooth = predict(fit, df)
+    rng = range(df$smooth, na.rm = TRUE)
+    brks = c(rng[1] + 0.1 * diff(rng), rng[2] - 0.1 * diff(rng))
+    ggplot(df[!is.na(df$smooth), ], aes(x = x, y = y, fill = smooth, color = smooth)) +
+        ggtitle(cl) +
+        geom_point(size = 0.3, shape = 21, stroke = 0) +
+        scale_fill_distiller(name = "Mean expr", palette = "YlOrRd", direction = 1,limits = rng, breaks = brks, labels = c("low", "high")) +
+        scale_color_distiller(name = "Mean expr", palette = "YlOrRd", direction = 1,limits = rng, breaks = brks, labels = c("low", "high")) +
+        guides(fill = guide_colorbar(frame.colour = "black", ticks = FALSE),
+               color = guide_colorbar(frame.colour = "black", ticks = FALSE)) +
+        scale_y_reverse() + coord_fixed() + theme_bw() +
+        theme(panel.grid = element_blank(), axis.title = element_blank(),
+              axis.text = element_blank(), axis.ticks = element_blank())
+})
+wrap_plots(cluster_plots)
+```
+
+```{r}
+#| label: vespucci-sci-gsea
+#| eval: false
+#| fig-width: 12
+#| fig-height: 8
+library(clusterProfiler)
+library(org.Mm.eg.db)
+
+gsea_results = lapply(cluster_ids, function(cl) {
+    cl_genes = genes_cluster_df$gene[genes_cluster_df$cluster == cl]
+    tryCatch(
+        enrichGO(gene = cl_genes, OrgDb = org.Mm.eg.db, keyType = "SYMBOL",
+                 ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.1),
+        error = function(e) NULL
+    )
+})
+names(gsea_results) = paste0("Cluster ", cluster_ids)
+
+# Top 5 terms per cluster
+gsea_df = map_dfr(names(gsea_results), function(cl_name) {
+    res = gsea_results[[cl_name]]
+    if (!is.null(res) && nrow(res) > 0)
+        head(as.data.frame(res), 5) %>% mutate(cluster = cl_name)
+})
+
+ggplot(gsea_df, aes(x = reorder(Description, -log10(p.adjust)), y = -log10(p.adjust), fill = cluster)) +
+    geom_col(show.legend = FALSE) +
+    coord_flip() +
+    facet_wrap(~ cluster, scales = "free_y") +
+    scale_x_discrete(labels = function(x) str_wrap(x, 30)) +
+    theme_bw() + theme(panel.grid.minor = element_blank(), axis.title.y = element_blank()) +
+    labs(y = "-log10 adjusted p-value", title = "GO:BP enrichment per DE gene cluster")
+```
+
+---
+
+::: {.callout-warning}
+## CHECKPOINT
+
+What does spatial location add that single-cell alone could not tell you?
+
+- From the simulation: DE genes (`truth = 1`) are upregulated between conditions only in the perturbed circle. Was Moran's I AUPRC above the random baseline of 0.5? What does this tell you about whether SVG analysis is an appropriate tool for this kind of comparison?
+- Look at the Vespucci spatial AUC map: does the region of high AUC match the ground truth circle? How precisely does Vespucci localise the perturbation signal?
+- Looking at the Vespucci AUC map for the SCI data: is the injury response uniform across the spinal cord cross-section, or concentrated in specific anatomical regions? How does this relate to the RCTD cell type distribution?
+- Moran's I is applied within a single condition. Vespucci classifies *between* conditions at each location. What does this mean for experimental design — can you run Vespucci on a single tissue section?
+:::
+
+---
+
+## Challenge: Apply to your own data
+
+Find a publicly available **spatial transcriptomics dataset** and apply the Moran's I (and optionally Vespucci) pipeline from this notebook. A single tissue section is enough for SVG analysis; two sections under different conditions unlock Vespucci.
+
+A convenient dataset with known spatial structure is the **Maynard et al. 2021 Human Dorsolateral Prefrontal Cortex (DLPFC)** Visium data, available via the `spatialLIBD` Bioconductor package. It contains 12 sections from 3 donors with annotated cortical layers (L1–L6 + WM) — ideal for validating that Moran's I recovers layer-specific marker genes.
+
+```{r}
+#| label: byod-nb4
+#| eval: false
+# Install if needed: BiocManager::install("spatialLIBD")
+library(spatialLIBD)
+
+# Downloads ~2 GB SpatialExperiment object the first time
+spe = fetch_data(type = "spe")
+
+# Use one section as an example (sample 151507)
+spe_sub = spe[, spe$sample_id == "151507"]
+
+# Convert to Seurat (requires SeuratObject >= 5 and SeuratDisk)
+# library(SeuratDisk)
+# spatial_obj = as.Seurat(spe_sub, ...)
+
+# Alternatively, load a pre-converted Seurat object if available
+# spatial_obj = readRDS(file.path(PROJ_DIR, "dlpfc-151507.rds"))
+
+# Normalise and run Moran's I
+# spatial_obj = SCTransform(spatial_obj, assay = "Spatial", verbose = FALSE)
+# spatial_obj = FindVariableFeatures(spatial_obj)
+# spatial_obj = FindSpatiallyVariableFeatures(spatial_obj,
+#     features = VariableFeatures(spatial_obj),
+#     selection.method = "moransi")
+
+# Extract results
+# svf_meta = spatial_obj@assays[["SCT"]]@meta.features
+# moran_res = data.frame(gene = rownames(svf_meta), I = svf_meta$MoransI_observed)
+# head(moran_res[order(-moran_res$I, na.last = TRUE), ], 20)
+```
+
+The DLPFC dataset has strong cortical layer structure. Top spatially variable genes should include known layer markers: *RORB* and *CARTPT* (L4), *BCL11B* and *FEZF2* (L5/6), *MBP* and *KRT17* (white matter). Finding these through an unbiased Moran's I scan validates the method and demonstrates that spatial autocorrelation correctly recovers anatomically meaningful genes.
+
+For a Vespucci-compatible dataset with two conditions, look for Visium experiments comparing injured vs uninjured tissue (e.g. stroke, tumour, or autoimmune disease models) deposited on Zenodo or GEO.
+
+### Where else to find data
+
+- **10x Genomics public datasets** (`10xgenomics.com/datasets`) — mouse brain, human brain, mouse spinal cord Visium
+- **GEO / Zenodo** — many spatial papers deposit SpaceRanger outputs or Seurat objects; load with `Load10X_Spatial()` or `readRDS()`
